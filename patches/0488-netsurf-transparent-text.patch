@@ -1,0 +1,130 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index a042cbeac..5ed10e12a 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -2268,7 +2268,10 @@ static bool html_redraw_text_decoration(const html_content *html,
+ 	if (css_computed_text_decoration_color(box->style, &col) !=
+ 			CSS_TEXT_DECORATION_COLOR_COLOR) {
+ 		css_computed_color(box->style, &col);
+-	} else if (nscss_color_is_transparent(col)) {
++	}
++	/* a transparent line, the text's own colour included, is not
++	 * drawn (VitaSurf) */
++	if (nscss_color_is_transparent(col)) {
+ 		return true;
+ 	}
+ 	fgcol = nscss_color_to_ns(col);
+diff --git a/frontends/framebuffer/fbtk/text.c b/frontends/framebuffer/fbtk/text.c
+index 7e81249d1..fc82c2728 100644
+--- a/frontends/framebuffer/fbtk/text.c
++++ b/frontends/framebuffer/fbtk/text.c
+@@ -75,7 +75,11 @@ fb_text_font_style(fbtk_widget_t *widget, int *font_height, int *padding,
+ 	font_style->weight = 400;
+ 	font_style->flags = FONTF_NONE;
+ 	font_style->background = widget->bg;
+-	font_style->foreground = widget->fg;
++	/* a widget's colour has libnsfb's alpha in its top byte, where a
++	 * plot style has NetSurf's (one less the alpha), which the text
++	 * plotter now reads (VitaSurf) */
++	font_style->foreground = (widget->fg & 0xffffff) |
++			((~widget->fg) & 0xff000000);
+ 	/* No CSS family list: the font engine consults it for web fonts
+ 	 * (VitaSurf), and a stack garbage pointer there is a crash the
+ 	 * first time a page registers one. */
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index f4619d65c..d03ed01e2 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -1269,6 +1269,54 @@ framebuffer_plot_bitmap(const struct redraw_context *ctx,
+ 
+ 
+ #ifdef FB_USE_FREETYPE
++/**
++ * A glyph whose colour is partly transparent (VitaSurf): libnsfb's glyph
++ * plotters take the colour's alpha as opaque, so its coverage is scaled
++ * by the alpha into a buffer of its own, which glyph8 then lays over
++ * what is there. A glyph too big for the buffer is drawn as it is.
++ */
++static void
++fb_plot_glyph_alpha(nsfb_bbox_t *loc, const FT_Bitmap *bm,
++		nsfb_colour_t colour, unsigned int alpha)
++{
++	static uint8_t *buf = NULL;
++	static size_t buf_size = 0;
++	size_t need = (size_t) bm->width * bm->rows;
++	unsigned int r, c;
++	bool mono = bm->pixel_mode == FT_PIXEL_MODE_MONO;
++
++	if (need == 0)
++		return;
++	if (need > buf_size) {
++		uint8_t *n = need <= 65536 ? realloc(buf, need) : NULL;
++
++		if (n == NULL) {
++			if (mono)
++				nsfb_plot_glyph1(nsfb, loc, bm->buffer,
++						 bm->pitch, colour);
++			else
++				nsfb_plot_glyph8(nsfb, loc, bm->buffer,
++						 bm->pitch, colour);
++			return;
++		}
++		buf = n;
++		buf_size = need;
++	}
++	for (r = 0; r < bm->rows; r++) {
++		const uint8_t *row = bm->buffer + (int) r * bm->pitch;
++		uint8_t *out = buf + (size_t) r * bm->width;
++
++		for (c = 0; c < bm->width; c++) {
++			unsigned int cover = mono ?
++				((row[c >> 3] >> (7 - (c & 7))) & 1) * 255 :
++				row[c];
++
++			out[c] = (uint8_t) ((cover * alpha + 127) / 255);
++		}
++	}
++	nsfb_plot_glyph8(nsfb, loc, buf, (int) bm->width, colour);
++}
++
+ /**
+  * Text plotting.
+  *
+@@ -1295,6 +1343,13 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+ 	/* tabular-nums: each digit centred in the widest one's advance,
+ 	 * as fb_font_width measured it (VitaSurf) */
+ 	int digit_w = fb_font_digit_width(fstyle);
++	/* the colour's alpha, which NetSurf keeps as its complement in
++	 * the top byte: transparent text is not drawn, where its glyphs
++	 * had been opaque (VitaSurf) */
++	unsigned int alpha = 255 - ((fstyle->foreground >> 24) & 0xff);
++
++	if (alpha == 0)
++		return NSERROR_OK;
+ 
+ 	while (nxtchr < length) {
+ 		size_t start = nxtchr;
+@@ -1323,7 +1378,11 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+ 			loc.y1 = loc.y0 + bglyph->bitmap.rows;
+ 
+ 			/* now, draw to our target surface */
+-			if (bglyph->bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
++			if (alpha < 255) {
++			    fb_plot_glyph_alpha(&loc, &bglyph->bitmap,
++						fstyle->foreground, alpha);
++			} else if (bglyph->bitmap.pixel_mode ==
++					FT_PIXEL_MODE_MONO) {
+ 			    nsfb_plot_glyph1(nsfb,
+ 					     &loc,
+ 					     bglyph->bitmap.buffer,
+@@ -1375,6 +1434,10 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+     int w = FB_FONT_WIDTH * size;
+     int h = FB_FONT_HEIGHT * size;
+ 
++    /* transparent text is not drawn (VitaSurf) */
++    if (((fstyle->foreground >> 24) & 0xff) == 0xff)
++	return NSERROR_OK;
++
+     y -= ((h * 3) / 4);
+     /* the coord is the bottom-left of the pixels offset by 1 to make
+      * it work since fb coords are the top-left of pixels */

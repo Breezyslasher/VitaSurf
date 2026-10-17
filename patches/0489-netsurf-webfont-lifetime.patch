@@ -1,0 +1,440 @@
+diff --git a/content/handlers/html/webfont.c b/content/handlers/html/webfont.c
+index 09df535fe..e62acdac3 100644
+--- a/content/handlers/html/webfont.c
++++ b/content/handlers/html/webfont.c
+@@ -55,7 +55,10 @@
+ #include "html/private.h"
+ #include "html/webfont.h"
+ 
+-/** The most bytes held across every face; the Vita has little to spare. */
++/** The most bytes held across every face; the Vita has little to spare.
++ * A face is held while a page that asked for it lives (VitaSurf): they
++ * had been held for the whole session, and nine sites into a run every
++ * later site's fonts were refused as too large. */
+ #define WEBFONT_BYTES_MAX (2 * 1024 * 1024)
+ /** The most one face may be; icon fonts and text faces sit well under. */
+ #define WEBFONT_FACE_MAX (700 * 1024)
+@@ -74,7 +77,10 @@ struct webfont {
+ 	llcache_handle *fetch;
+ 	uint8_t *data;
+ 	size_t len, cap;
+-	struct html_content *owner;	/**< the page to lay out again */
++	/** the pages that asked for the family, laid out again when it
++	 * arrives and holding it until the last of them goes (VitaSurf) */
++	struct html_content **users;
++	unsigned n_users, cap_users;
+ 	struct webfont *next;
+ };
+ 
+@@ -99,6 +105,29 @@ static bool webfont_generic(const char *name)
+ 	return false;
+ }
+ 
++/** Note a page as using a face; false if it could not be noted. */
++static bool webfont_use(struct webfont *wf, struct html_content *html)
++{
++	unsigned i;
++
++	for (i = 0; i < wf->n_users; i++) {
++		if (wf->users[i] == html)
++			return true;
++	}
++	if (wf->n_users == wf->cap_users) {
++		unsigned ncap = wf->cap_users == 0 ? 2 : wf->cap_users * 2;
++		struct html_content **n = realloc(wf->users,
++				ncap * sizeof(*n));
++
++		if (n == NULL)
++			return false;
++		wf->users = n;
++		wf->cap_users = ncap;
++	}
++	wf->users[wf->n_users++] = html;
++	return true;
++}
++
+ static struct webfont *webfont_find(const char *family, int weight, bool italic)
+ {
+ 	struct webfont *wf;
+@@ -275,15 +304,77 @@ static int webfont_src_rank(const css_font_face_src *src, const char *url)
+ 
+ static void webfont_reformat(struct webfont *wf)
+ {
+-	struct html_content *html = wf->owner;
++	unsigned i;
+ 
+-	if (html == NULL)
+-		return;
+-	if (html->base.status != CONTENT_STATUS_READY &&
+-			html->base.status != CONTENT_STATUS_DONE)
++	for (i = 0; i < wf->n_users; i++) {
++		struct html_content *html = wf->users[i];
++
++		if (html->base.status != CONTENT_STATUS_READY &&
++				html->base.status != CONTENT_STATUS_DONE)
++			continue;
++		content__reformat(&html->base, false,
++				html->base.available_width,
++				html->base.available_height);
++	}
++}
++
++/** Take a face out of the list and let it go, with its bytes. */
++static void webfont_drop(struct webfont **pp)
++{
++	struct webfont *wf = *pp;
++
++	if (wf->state == WEBFONT_LOADING && wf->fetch != NULL) {
++		llcache_handle_abort(wf->fetch);
++		llcache_handle_release(wf->fetch);
++		wf->fetch = NULL;
++	}
++	if (wf->state == WEBFONT_LOADED) {
++		guit->layout->remove_face(wf->family, wf->weight, wf->italic);
++		NSLOG(netsurf, INFO, "web font %s %d%s let go, %u bytes",
++				wf->family, wf->weight,
++				wf->italic ? " italic" : "", (unsigned) wf->len);
++	}
++	webfont_bytes -= wf->len;
++	*pp = wf->next;
++	free(wf->data);
++	free(wf->users);
++	free(wf->family);
++	free(wf);
++}
++
++/**
++ * Make room for more bytes of face (VitaSurf). A page left behind stays
++ * in the cache for a move back, without a window, and keeps its faces
++ * until the cache lets it go; those are let go first, oldest first, so
++ * the page now loading has its own.
++ */
++static void webfont_make_room(size_t more)
++{
++	struct webfont **pp, **oldest;
++
++	if (guit->layout->remove_face == NULL)
+ 		return;
+-	content__reformat(&html->base, false, html->base.available_width,
+-			html->base.available_height);
++	while (webfont_bytes + more > WEBFONT_BYTES_MAX) {
++		oldest = NULL;
++		for (pp = &webfonts; *pp != NULL; pp = &(*pp)->next) {
++			struct webfont *wf = *pp;
++			unsigned i;
++
++			if (wf->state != WEBFONT_LOADED)
++				continue;
++			for (i = 0; i < wf->n_users; i++) {
++				if (content_count_users(
++						&wf->users[i]->base) > 0)
++					break;
++			}
++			/* the list is newest first */
++			if (i == wf->n_users)
++				oldest = pp;
++		}
++		if (oldest == NULL)
++			return;
++		webfont_drop(oldest);
++	}
+ }
+ 
+ static nserror webfont_callback(llcache_handle *handle,
+@@ -293,6 +384,8 @@ static nserror webfont_callback(llcache_handle *handle,
+ 
+ 	switch (event->type) {
+ 	case LLCACHE_EVENT_HAD_DATA:
++		if (wf->len + event->data.data.len <= WEBFONT_FACE_MAX)
++			webfont_make_room(event->data.data.len);
+ 		if (wf->len + event->data.data.len > WEBFONT_FACE_MAX ||
+ 				webfont_bytes + event->data.data.len >
+ 					WEBFONT_BYTES_MAX) {
+@@ -390,8 +483,11 @@ static void webfont_fetch(struct html_content *html, const char *family,
+ 	nsurl *nurl;
+ 	nserror err;
+ 
+-	if (webfont_find(family, weight, italic) != NULL)
++	wf = webfont_find(family, weight, italic);
++	if (wf != NULL) {
++		webfont_use(wf, html);
+ 		return;
++	}
+ 
+ 	if (nsurl_create(url, &nurl) != NSERROR_OK)
+ 		return;
+@@ -410,7 +506,12 @@ static void webfont_fetch(struct html_content *html, const char *family,
+ 	wf->weight = weight;
+ 	wf->italic = italic;
+ 	wf->state = WEBFONT_LOADING;
+-	wf->owner = html;
++	if (!webfont_use(wf, html)) {
++		free(wf->family);
++		free(wf);
++		nsurl_unref(nurl);
++		return;
++	}
+ 	wf->next = webfonts;
+ 	webfonts = wf;
+ 
+@@ -469,8 +570,18 @@ static void webfont_request_family(struct html_content *html,
+ 	int fetched = 0;
+ 	bool latin_only = false;
+ 
+-	if (webfont_generic(name) || webfont_family_known(name))
++	if (webfont_generic(name))
++		return;
++	if (webfont_family_known(name)) {
++		/* this page holds the faces another asked for too */
++		struct webfont *wf;
++
++		for (wf = webfonts; wf != NULL; wf = wf->next) {
++			if (strcasecmp(wf->family, name) == 0)
++				webfont_use(wf, html);
++		}
+ 		return;
++	}
+ 
+ 	if (webfont_missed(html, family))
+ 		return;
+@@ -545,12 +656,15 @@ static void webfont_request_family(struct html_content *html,
+ 		 * for every element */
+ 		struct webfont *wf = calloc(1, sizeof(*wf));
+ 
+-		if (wf != NULL && (wf->family = strdup(name)) != NULL) {
++		if (wf != NULL && (wf->family = strdup(name)) != NULL &&
++				webfont_use(wf, html)) {
+ 			wf->weight = 400;
+ 			wf->state = WEBFONT_FAILED;
+ 			wf->next = webfonts;
+ 			webfonts = wf;
+ 		} else {
++			if (wf != NULL)
++				free(wf->family);
+ 			free(wf);
+ 		}
+ 	}
+@@ -580,11 +694,24 @@ void html_webfont_request(struct html_content *html,
+ /* exported interface documented in html/webfont.h */
+ void html_webfont_forget(struct html_content *html)
+ {
+-	struct webfont *wf;
++	struct webfont **pp = &webfonts, *wf;
+ 
+-	for (wf = webfonts; wf != NULL; wf = wf->next) {
+-		if (wf->owner == html)
+-			wf->owner = NULL;
++	/* the faces no page holds any more go, and their bytes with them
++	 * (VitaSurf); a frontend that cannot let a face go keeps it */
++	while ((wf = *pp) != NULL) {
++		unsigned i, n = 0;
++
++		for (i = 0; i < wf->n_users; i++) {
++			if (wf->users[i] != html)
++				wf->users[n++] = wf->users[i];
++		}
++		wf->n_users = n;
++		if (n > 0 || (wf->state == WEBFONT_LOADED &&
++				guit->layout->remove_face == NULL)) {
++			pp = &wf->next;
++			continue;
++		}
++		webfont_drop(pp);
+ 	}
+ 
+ 	if (webfont_miss.page == html)
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index 2780c8793..db9563cc8 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -409,6 +409,52 @@ static nserror fb_font_add_face(const char *family, int weight, bool italic,
+ 	return NSERROR_OK;
+ }
+ 
++/* the advance cache, below, keeps rows by face */
++static void fb_adv_forget(FTC_FaceID face_id);
++
++/** One web face's entry, out of FreeType's cache and ours (VitaSurf). */
++static void fb_web_face_free(fb_faceid_t *f)
++{
++	if (f == NULL)
++		return;
++	FTC_Manager_RemoveFaceID(ft_cmanager, (FTC_FaceID) f);
++	fb_adv_forget((FTC_FaceID) f);
++	free(f->liga);
++	free(f->liga_pool);
++	free(f->liga_starts);
++	free(f->liga_seconds);
++	free(f);
++}
++
++/**
++ * Let go of a web font face (VitaSurf). See gui_layout_table.remove_face.
++ * Its weighted instances share its bytes, which go last.
++ */
++static nserror fb_font_remove_face(const char *family, int weight,
++		bool italic)
++{
++	struct fb_webface **pp, *wf;
++
++	for (pp = &fb_webfaces; (wf = *pp) != NULL; pp = &wf->next) {
++		uint8_t *data;
++		int i;
++
++		if (wf->weight != weight || wf->italic != italic ||
++				strcasecmp(wf->family, family) != 0)
++			continue;
++		*pp = wf->next;
++		data = wf->face->data;
++		for (i = 0; i < 9; i++)
++			fb_web_face_free(wf->at_weight[i]);
++		fb_web_face_free(wf->face);
++		free(data);
++		free(wf->family);
++		free(wf);
++		return NSERROR_OK;
++	}
++	return NSERROR_NOT_FOUND;
++}
++
+ /**
+  * A web face at a weight (VitaSurf): the face itself, unless it is a
+  * variable font, when it is an instance of it set to the nearest
+@@ -1333,9 +1379,11 @@ static unsigned adv_stamp;
+ /** The cache row for a style, reusing the least recently used row. */
+ static struct adv_style *fb_adv_slot(FTC_ScalerRec *srec)
+ {
+-	struct adv_style *oldest = &adv_styles[0];
++	struct adv_style *oldest = &adv_styles[0], *empty = NULL;
+ 	int i;
+ 
++	/* a face let go leaves a hole, so an empty row does not end the
++	 * search (VitaSurf) */
+ 	for (i = 0; i < ADV_STYLES; i++) {
+ 		struct adv_style *s = &adv_styles[i];
+ 
+@@ -1345,13 +1393,17 @@ static struct adv_style *fb_adv_slot(FTC_ScalerRec *srec)
+ 			return s;
+ 		}
+ 		if (!s->used) {
+-			oldest = s;
+-			break;
++			if (empty == NULL)
++				empty = s;
++			continue;
+ 		}
+-		if (s->stamp < oldest->stamp) {
++		if (s->stamp < oldest->stamp || !oldest->used) {
+ 			oldest = s;
+ 		}
+ 	}
++	if (empty != NULL) {
++		oldest = empty;
++	}
+ 	oldest->face_id = srec->face_id;
+ 	oldest->size = srec->width;
+ 	oldest->res = srec->x_res;
+@@ -1363,6 +1415,20 @@ static struct adv_style *fb_adv_slot(FTC_ScalerRec *srec)
+ 	return oldest;
+ }
+ 
++/** Drop the rows of a face that is going (VitaSurf): another may be
++ * given its address. */
++static void fb_adv_forget(FTC_FaceID face_id)
++{
++	int i;
++
++	for (i = 0; i < ADV_STYLES; i++) {
++		if (adv_styles[i].used && adv_styles[i].face_id == face_id) {
++			adv_styles[i].used = false;
++			adv_styles[i].face_id = NULL;
++		}
++	}
++}
++
+ /**
+  * How far one character advances, or -1 when it has no glyph.
+  *
+@@ -1941,6 +2007,7 @@ static struct gui_layout_table layout_table = {
+ 	.position = fb_font_position,
+ 	.split = fb_font_split,
+ 	.add_face = fb_font_add_face,
++	.remove_face = fb_font_remove_face,
+ 	.aspect = fb_font_aspect,
+ };
+ 
+diff --git a/frontends/monkey/layout.c b/frontends/monkey/layout.c
+index 8c8db9161..e57f3770b 100644
+--- a/frontends/monkey/layout.c
++++ b/frontends/monkey/layout.c
+@@ -22,6 +22,8 @@
+  */
+ 
+ #include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "utils/utf8.h"
+ #include "netsurf/plot_style.h"
+@@ -124,6 +126,25 @@ static nserror nsfont_aspect(const plot_font_style_t *fstyle, int metric,
+ 	return NSERROR_OK;
+ }
+ 
++/* Web fonts, when MONKEY_WEBFONTS is set (VitaSurf): taken and let go
++ * as the framebuffer frontend does, and said so on stdout, so a test
++ * can see a face held while a page uses it. Text is measured as before. */
++static nserror nsfont_add_face(const char *family, int weight, bool italic,
++			       uint8_t *data, size_t len)
++{
++	free(data);
++	fprintf(stdout, "FONT ADD %s %d%s %u\n", family, weight,
++		italic ? " italic" : "", (unsigned) len);
++	return NSERROR_OK;
++}
++
++static nserror nsfont_remove_face(const char *family, int weight, bool italic)
++{
++	fprintf(stdout, "FONT REMOVE %s %d%s\n", family, weight,
++		italic ? " italic" : "");
++	return NSERROR_OK;
++}
++
+ static struct gui_layout_table layout_table = {
+ 	.width = nsfont_width,
+ 	.position = nsfont_position_in_string,
+@@ -131,4 +152,12 @@ static struct gui_layout_table layout_table = {
+ 	.aspect = nsfont_aspect,
+ };
+ 
++__attribute__((constructor)) static void nsfont_webfonts(void)
++{
++	if (getenv("MONKEY_WEBFONTS") != NULL) {
++		layout_table.add_face = nsfont_add_face;
++		layout_table.remove_face = nsfont_remove_face;
++	}
++}
++
+ struct gui_layout_table *monkey_layout_table = &layout_table;
+diff --git a/include/netsurf/layout.h b/include/netsurf/layout.h
+index ae3842665..51f8c47af 100644
+--- a/include/netsurf/layout.h
++++ b/include/netsurf/layout.h
+@@ -104,6 +104,18 @@ struct gui_layout_table
+ 	nserror (*add_face)(const char *family, int weight, bool italic,
+ 			uint8_t *data, size_t len);
+ 
++	/**
++	 * Let go of a face add_face took (VitaSurf), when no page that
++	 * asked for it is left. Optional: without it a face is kept for
++	 * the session.
++	 *
++	 * \param[in] family  the family name add_face was given
++	 * \param[in] weight  its weight
++	 * \param[in] italic  its slant
++	 * \return NSERROR_OK if the face was found and let go.
++	 */
++	nserror (*remove_face)(const char *family, int weight, bool italic);
++
+ 	/**
+ 	 * One of a font's metrics over its em (VitaSurf), for
+ 	 * font-size-adjust. Optional.
