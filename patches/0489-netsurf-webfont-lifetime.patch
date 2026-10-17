@@ -1,20 +1,30 @@
 diff --git a/content/handlers/html/webfont.c b/content/handlers/html/webfont.c
-index 09df535fe..e62acdac3 100644
+index 09df535fe..dac058e94 100644
 --- a/content/handlers/html/webfont.c
 +++ b/content/handlers/html/webfont.c
-@@ -55,7 +55,10 @@
+@@ -55,10 +55,17 @@
  #include "html/private.h"
  #include "html/webfont.h"
  
 -/** The most bytes held across every face; the Vita has little to spare. */
-+/** The most bytes held across every face; the Vita has little to spare.
-+ * A face is held while a page that asked for it lives (VitaSurf): they
-+ * had been held for the whole session, and nine sites into a run every
-+ * later site's fonts were refused as too large. */
- #define WEBFONT_BYTES_MAX (2 * 1024 * 1024)
- /** The most one face may be; icon fonts and text faces sit well under. */
- #define WEBFONT_FACE_MAX (700 * 1024)
-@@ -74,7 +77,10 @@ struct webfont {
+-#define WEBFONT_BYTES_MAX (2 * 1024 * 1024)
+-/** The most one face may be; icon fonts and text faces sit well under. */
+-#define WEBFONT_FACE_MAX (700 * 1024)
++/** The most bytes held across every face. A face is held while a page
++ * that asked for it lives (VitaSurf): they had been held for the whole
++ * session, and nine sites into a run every later site's fonts were
++ * refused as too large. Six megabytes is two heavy pages' faces, the
++ * one being left and the one loading (DuckDuckGo's two are 654 KB,
++ * CNN's five 572 KB), and the heap peaked at 218 MB of 311 MB in
++ * build 765's site test. */
++#define WEBFONT_BYTES_MAX (6 * 1024 * 1024)
++/** The most one face may be; icon fonts and Latin text faces sit well
++ * under, a whole CJK face well over. */
++#define WEBFONT_FACE_MAX (1536 * 1024)
+ 
+ enum webfont_state {
+ 	WEBFONT_LOADING,
+@@ -74,7 +81,10 @@ struct webfont {
  	llcache_handle *fetch;
  	uint8_t *data;
  	size_t len, cap;
@@ -26,7 +36,7 @@ index 09df535fe..e62acdac3 100644
  	struct webfont *next;
  };
  
-@@ -99,6 +105,29 @@ static bool webfont_generic(const char *name)
+@@ -99,6 +109,29 @@ static bool webfont_generic(const char *name)
  	return false;
  }
  
@@ -56,7 +66,7 @@ index 09df535fe..e62acdac3 100644
  static struct webfont *webfont_find(const char *family, int weight, bool italic)
  {
  	struct webfont *wf;
-@@ -275,15 +304,77 @@ static int webfont_src_rank(const css_font_face_src *src, const char *url)
+@@ -275,15 +308,77 @@ static int webfont_src_rank(const css_font_face_src *src, const char *url)
  
  static void webfont_reformat(struct webfont *wf)
  {
@@ -141,7 +151,7 @@ index 09df535fe..e62acdac3 100644
  }
  
  static nserror webfont_callback(llcache_handle *handle,
-@@ -293,6 +384,8 @@ static nserror webfont_callback(llcache_handle *handle,
+@@ -293,11 +388,21 @@ static nserror webfont_callback(llcache_handle *handle,
  
  	switch (event->type) {
  	case LLCACHE_EVENT_HAD_DATA:
@@ -150,7 +160,22 @@ index 09df535fe..e62acdac3 100644
  		if (wf->len + event->data.data.len > WEBFONT_FACE_MAX ||
  				webfont_bytes + event->data.data.len >
  					WEBFONT_BYTES_MAX) {
-@@ -390,8 +483,11 @@ static void webfont_fetch(struct html_content *html, const char *family,
+-			NSLOG(netsurf, INFO, "web font %s too large, dropped",
+-					wf->family);
++			NSLOG(netsurf, INFO, "web font %s too large, "
++					"dropped: %s past %u KB",
++					wf->family,
++					wf->len + event->data.data.len >
++						WEBFONT_FACE_MAX ?
++						"the face" : "every face held",
++					(unsigned) ((wf->len + event->data.data.len >
++						WEBFONT_FACE_MAX ?
++						WEBFONT_FACE_MAX :
++						WEBFONT_BYTES_MAX) / 1024));
+ 			wf->state = WEBFONT_FAILED;
+ 			free(wf->data);
+ 			wf->data = NULL;
+@@ -390,8 +495,11 @@ static void webfont_fetch(struct html_content *html, const char *family,
  	nsurl *nurl;
  	nserror err;
  
@@ -163,7 +188,7 @@ index 09df535fe..e62acdac3 100644
  
  	if (nsurl_create(url, &nurl) != NSERROR_OK)
  		return;
-@@ -410,7 +506,12 @@ static void webfont_fetch(struct html_content *html, const char *family,
+@@ -410,7 +518,12 @@ static void webfont_fetch(struct html_content *html, const char *family,
  	wf->weight = weight;
  	wf->italic = italic;
  	wf->state = WEBFONT_LOADING;
@@ -177,7 +202,7 @@ index 09df535fe..e62acdac3 100644
  	wf->next = webfonts;
  	webfonts = wf;
  
-@@ -469,8 +570,18 @@ static void webfont_request_family(struct html_content *html,
+@@ -469,8 +582,18 @@ static void webfont_request_family(struct html_content *html,
  	int fetched = 0;
  	bool latin_only = false;
  
@@ -197,7 +222,7 @@ index 09df535fe..e62acdac3 100644
  
  	if (webfont_missed(html, family))
  		return;
-@@ -545,12 +656,15 @@ static void webfont_request_family(struct html_content *html,
+@@ -545,12 +668,15 @@ static void webfont_request_family(struct html_content *html,
  		 * for every element */
  		struct webfont *wf = calloc(1, sizeof(*wf));
  
@@ -214,7 +239,7 @@ index 09df535fe..e62acdac3 100644
  			free(wf);
  		}
  	}
-@@ -580,11 +694,24 @@ void html_webfont_request(struct html_content *html,
+@@ -580,11 +706,24 @@ void html_webfont_request(struct html_content *html,
  /* exported interface documented in html/webfont.h */
  void html_webfont_forget(struct html_content *html)
  {
