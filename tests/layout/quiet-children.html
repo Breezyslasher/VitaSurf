@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<!--
+  One child put into an element, or taken out, after load (VitaSurf).
+  When it is not displayed (or a comment), and no selector has asked
+  about the order of the element's children or whether it has any, the
+  page is not built again: the log must not say "need the layout
+  rebuilt" for the hidden iframe, the hidden div, the comment and the
+  removal at the start. The rest are put where a selector does ask
+  (:last-child, "+", :empty, :has(), :nth-child), and must restyle
+  what they reach. The hidden iframe still loads, as in a browser.
+  Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Quiet children</title>
+<style>
+.last > div { width: 100px; }
+.last > div:last-child { width: 200px; }
+.adj > .a + div { width: 150px; }
+.adj > div { width: 100px; }
+.emp { width: 100px; }
+.emp:empty { width: 300px; }
+.has { width: 100px; }
+.has:has(> i) { width: 250px; }
+.nth > div { width: 100px; }
+.nth > div:nth-child(2) { width: 120px; }
+</style></head>
+<body>
+<div id="gone" style="display:none">hidden</div>
+<div class="last"><div id="l1">one</div></div>
+<div class="adj"><div id="a2">two</div></div>
+<div class="emp" id="e"></div>
+<div class="has" id="h"><span>x</span></div>
+<div class="nth"><div id="n1">one</div><div id="n2">two</div></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('quiet-children: ' + l); }
+function $(id) { return document.getElementById(id); }
+function el(tag, attrs) { var e = document.createElement(tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
+window.frameLoaded = 0;
+var steps = [
+  function () {
+    window.w0 = document.body.offsetWidth;
+    var f = el('iframe', { style: 'display:none', srcdoc: '<script>parent.frameLoaded++<\/script>' });
+    document.body.appendChild(f);
+  },
+  function () { document.body.appendChild(el('div', { hidden: '' })); },
+  function () { document.body.appendChild(document.createComment('c')); },
+  function () { $('gone').remove(); },
+  function () {
+    ok('the hidden iframe loaded', window.frameLoaded, 1);
+    ok('the page kept its width', document.body.offsetWidth, window.w0);
+    ok('the hidden div was taken out', $('gone'), null);
+    document.querySelector('.last').appendChild(el('div', {}));
+  },
+  function () {
+    ok(':last-child moves to the new child', $('l1').offsetWidth, 100);
+    document.querySelector('.adj').insertBefore(el('div', { 'class': 'a', style: 'display:none' }), $('a2'));
+  },
+  function () {
+    ok('"+" reaches past a hidden child put before', $('a2').offsetWidth, 150);
+    $('e').appendChild(el('span', { style: 'display:none' }));
+  },
+  function () {
+    ok(':empty stops matching for a hidden child', $('e').offsetWidth, 100);
+    $('h').appendChild(el('i', { style: 'display:none' }));
+  },
+  function () {
+    ok(':has() matches a hidden child', $('h').offsetWidth, 250);
+    document.querySelector('.nth').insertBefore(el('div', { style: 'display:none' }), $('n1'));
+  },
+  function () {
+    ok(':nth-child moves for a hidden child put first', $('n1').offsetWidth, 120);
+    ok('and leaves the one after', $('n2').offsetWidth, 100);
+    $('out').textContent = out.join('\n');
+    console.log('quiet-children: done');
+  }
+];
+addEventListener('load', function () {
+  var i = 0;
+  (function next() {
+    steps[i++]();
+    if (i < steps.length)
+      setTimeout(next, i === 4 ? 400 : 100);
+  })();
+});
+</script>
+</body></html>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<!--
+  A change a :has() asks about, made by script after load (VitaSurf).
+  When every :has() of the sheets it reaches is in the subject's
+  compound, the element's ancestors (and with "+" or "~" its earlier
+  siblings) are restyled in place, with what inherits from them, and
+  the page is not built again: the log must not say "need the layout
+  rebuilt ... which a :has() selector asks about" for the first four
+  changes. A :has() left of a combinator still builds the page again.
+  Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>:has() restyle</title>
+<style>
+.w1 { width: 100px; }
+.w1:has(.on1) { width: 200px; }
+.w2 { width: 100px; }
+.w2:has(> [style*="red"]) { width: 250px; }
+.w3 { width: 100px; }
+.w3:has(+ .on3) { width: 150px; }
+.w5 { font-size: 10px; }
+.w5:has(.on5) { font-size: 30px; }
+.w6 { width: 100px; }
+.w6:has(~ .on6) { width: 120px; }
+</style>
+<style>
+.w4 .t4 { width: 100px; }
+.w4:has(.on4) .t4 { width: 180px; }
+</style>
+</head>
+<body>
+<div class="w1" id="w1"><div><span id="c1">one</span></div></div>
+<div class="w2" id="w2"><span id="c2">two</span></div>
+<div class="w3" id="w3">three</div><div id="c3">next</div>
+<div class="w4"><div class="t4" id="t4">four</div><span id="c4">x</span></div>
+<div class="w5"><div><span id="t5" style="display:inline-block">five</span><b id="c5">y</b></div></div>
+<div class="w6" id="w6">six</div><p>between</p><div id="c6">later</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('has-restyle: ' + l); }
+function $(id) { return document.getElementById(id); }
+var steps = [
+  function () {
+    ok('before: an ancestor with nothing :has() looks for', $('w1').offsetWidth, 100);
+    $('c1').className = 'on1';
+  },
+  function () {
+    ok('a class a descendant gets restyles the ancestor', $('w1').offsetWidth, 200);
+    $('c1').className = '';
+  },
+  function () {
+    ok('and losing it restyles it back', $('w1').offsetWidth, 100);
+    $('c2').setAttribute('style', 'color: red');
+  },
+  function () {
+    ok('a child\'s style attribute restyles the parent', $('w2').offsetWidth, 250);
+    $('c3').className = 'on3';
+  },
+  function () {
+    ok('a class the next sibling gets restyles the one before', $('w3').offsetWidth, 150);
+    $('c6').className = 'on6';
+  },
+  function () {
+    ok('a class a later sibling gets restyles an earlier one', $('w6').offsetWidth, 120);
+    var h = $('t5').offsetHeight;
+    $('c5').className = 'on5';
+    window.h5 = h;
+  },
+  function () {
+    ok('what inherits from the ancestor follows it', $('t5').offsetHeight > window.h5 * 2, true);
+    $('c4').className = 'on4';
+  },
+  function () {
+    ok('a :has() left of a combinator restyles what is under the subject', $('t4').offsetWidth, 180);
+    document.getElementById('out').textContent = out.join('\n');
+    console.log('has-restyle: done');
+  }
+];
+addEventListener('load', function () {
+  var i = 0;
+  (function next() {
+    steps[i++]();
+    if (i < steps.length)
+      setTimeout(next, 100);
+  })();
+});
+</script>
+</body></html>

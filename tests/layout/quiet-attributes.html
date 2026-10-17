@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  Changes that build no boxes, made by script after load (VitaSurf): a
+  script, a style and new text in the title put into the head (the
+  style still applies), a script's async, type and src (one that went
+  in empty runs when it gets its src), a hidden link's href, and the
+  name of an iframe that
+  is not displayed, whose frame takes the name at once (tap "go" after
+  load: it opens in the hidden frame, so the page stays). The log must
+  not say "need the layout rebuilt" for any of them. Each line must
+  say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Quiet attributes</title>
+<style>#box { width: 100px; }</style></head>
+<body>
+<div style="display:none"><a id="hidden" href="#one">hidden link</a></div>
+<iframe id="f" style="display:none" srcdoc="<p>frame</p>"></iframe>
+<a id="go" href="about:blank" target="hid" style="display:block;width:100px">go</a>
+<div id="box">box</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('quiet-attributes: ' + l); }
+function $(id) { return document.getElementById(id); }
+window.ran = 0;
+addEventListener('load', function () {
+  var w0 = document.body.offsetWidth;
+  var s = document.createElement('script');
+  document.head.appendChild(s);
+  s.async = true;
+  s.setAttribute('type', 'text/javascript');
+  s.src = 'data:text/javascript,window.ran%2B%2B';
+  var st = document.createElement('style');
+  st.textContent = '#box { width: 150px; }';
+  document.head.appendChild(st);
+  var t = document.createElement('script');
+  t.textContent = 'window.ran += 10;';
+  document.head.appendChild(t);
+  document.title = 'Quiet attributes, after';
+  $('hidden').href = '#two';
+  $('f').name = 'hid';
+  setTimeout(function () {
+    ok('both scripts ran', window.ran, 11);
+    ok('the style put in the head applies', $('box').offsetWidth, 150);
+    ok('the title is the new one', document.title, 'Quiet attributes, after');
+    ok('the hidden link has its new href', $('hidden').getAttribute('href'), '#two');
+    ok('the hidden frame has its new name', $('f').name, 'hid');
+    ok('the page kept its width', document.body.offsetWidth, w0);
+    $('out').textContent = out.join('\n');
+    console.log('quiet-attributes: done');
+  }, 300);
+});
+</script>
+</body></html>

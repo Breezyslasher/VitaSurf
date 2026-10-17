@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<!--
+  An image's width and height attributes changed by script after load
+  (VitaSurf). They are hints its style takes, so the image is restyled
+  in place: the log must not say "need the layout rebuilt ... width on
+  <IMG>". Taking them away gives it back its own size, which it then
+  waits for; a class that sizes it is restyled in place the same way.
+  Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Image size hints</title>
+<style>.big { width: 80px; } .half { width: 50%; height: auto; } #box { width: 200px; }</style></head>
+<body>
+<p><img id="i" width="50" height="50" src="data:image/gif;base64,R0lGODlhAgADAIAAAP///wAAACH5BAAAAAAALAAAAAACAAMAAAICDF4AOw=="></p>
+<div id="box"><img id="j" src="data:image/gif;base64,R0lGODlhAgADAIAAAP///wAAACH5BAAAAAAALAAAAAACAAMAAAICDF4AOw=="></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('img-size-hints: ' + l); }
+function $(id) { return document.getElementById(id); }
+addEventListener('load', function () {
+  ok('the size it was given', $('i').offsetWidth + 'x' + $('i').offsetHeight, '50x50');
+  $('i').width = 100;
+  setTimeout(function () {
+    ok('a new width', $('i').offsetWidth + 'x' + $('i').offsetHeight, '100x50');
+    $('i').removeAttribute('width');
+    $('i').removeAttribute('height');
+    setTimeout(function () {
+      ok('its own size with none given', $('i').offsetWidth + 'x' + $('i').offsetHeight, '2x3');
+      $('i').height = 30;
+      setTimeout(function () {
+        ok('a height alone keeps its shape', $('i').offsetWidth + 'x' + $('i').offsetHeight, '20x30');
+        $('j').className = 'big';
+        setTimeout(function () {
+          ok('a width from a class', $('j').offsetWidth + 'x' + $('j').offsetHeight, '80x120');
+          $('j').className = 'half';
+          setTimeout(function () {
+            ok('a percentage width', $('j').offsetWidth + 'x' + $('j').offsetHeight, '100x150');
+            $('out').textContent = out.join('\n');
+            console.log('img-size-hints: done');
+          }, 100);
+        }, 100);
+      }, 100);
+    }, 100);
+  }, 100);
+});
+</script>
+</body></html>

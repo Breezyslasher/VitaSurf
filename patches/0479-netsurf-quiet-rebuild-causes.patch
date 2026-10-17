@@ -1,0 +1,812 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index a98e9432b..b68accc78 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -57,6 +57,7 @@ static css_error parent_node_cross(void *pw, void *node, void **parent);
+ static css_error part_host(void *pw, void *node, lwc_string *const *names,
+ 		uint32_t n_names, void *prev, void **host);
+ static css_error node_tree_scope(void *pw, void *node, void **scope);
++static void note_order(void *pw, void *node, bool children);
+ static css_error sibling_node(void *pw, void *node, void **sibling);
+ static css_error first_child_node(void *pw, void *node, void **child);
+ static css_error next_sibling_node(void *pw, void *node, void **sibling);
+@@ -169,6 +170,7 @@ static css_select_handler selection_handler = {
+ 	parent_node_cross,
+ 	part_host,
+ 	node_tree_scope,
++	note_order,
+ };
+ 
+ /* The size of a node's container, for @container (VitaSurf) */
+@@ -1024,6 +1026,53 @@ static css_error node_tree_scope(void *pw, void *node, void **scope)
+ 	return CSS_OK;
+ }
+ 
++/** Mark an element whose children's order or presence a selector reads. */
++static void mark_children_ordered(dom_node *n)
++{
++	void *old = NULL;
++
++	if (dom_node_get_user_data(n, corestring_dom___ns_key_children_ordered,
++			&old) == DOM_NO_ERR && old != NULL)
++		return;
++	dom_node_set_user_data(n, corestring_dom___ns_key_children_ordered,
++			(void *) 1, NULL, &old);
++}
++
++/*
++ * A selector looked at a node's place among its siblings, or at its
++ * children (VitaSurf): the element whose children those are is marked,
++ * so that a child put into it or taken out is known to restyle more
++ * than itself (nscss_children_ordered). The mark stays with the element.
++ */
++static void note_order(void *pw, void *node, bool children)
++{
++	dom_node *n = node, *parent = NULL;
++	dom_node_type type;
++
++	(void)pw;
++	if (children) {
++		mark_children_ordered(n);
++		return;
++	}
++	if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR ||
++			parent == NULL)
++		return;
++	if (dom_node_get_node_type(parent, &type) == DOM_NO_ERR &&
++			type == DOM_ELEMENT_NODE)
++		mark_children_ordered(parent);
++	dom_node_unref(parent);
++}
++
++/* exported function documented in css/select.h */
++bool nscss_children_ordered(dom_node *n)
++{
++	void *mark = NULL;
++
++	return dom_node_get_user_data(n,
++			corestring_dom___ns_key_children_ordered, &mark) !=
++			DOM_NO_ERR || mark != NULL;
++}
++
+ /**
+  * Callback to retrieve the preceding sibling of a node.
+  *
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index de2954974..f52f3ab90 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -79,6 +79,14 @@ void nscss_clear_node_data(dom_node *n);
+  */
+ void *nscss_tree_scope(dom_node *n);
+ 
++/**
++ * Whether a selector has looked at the order of an element's children,
++ * or at whether it has any (VitaSurf): a sibling combinator, a
++ * pseudo-class of position, :empty or :has(). If not, a child put into
++ * it or taken out restyles nothing but itself.
++ */
++bool nscss_children_ordered(dom_node *n);
++
+ /**
+  * Take the selection data libcss cached on a node off it, without
+  * destroying it, so the node can be selected for again and the data put
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 51cc2819e..0d5a79a17 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3187,6 +3187,24 @@ static void html_clear_box_nodes(struct box *b)
+ 	}
+ }
+ 
++/** Whether a pseudo-element's content is text alone, which nothing
++ * put before it changes: no counters and no quotes. */
++static bool show_after_plain(const css_computed_style *style)
++{
++	const css_computed_content_item *item = NULL;
++
++	if (css_computed_content(style, &item) != CSS_CONTENT_SET ||
++			item == NULL)
++		return true;
++	for (; item->type != CSS_COMPUTED_CONTENT_NONE; item++) {
++		if (item->type != CSS_COMPUTED_CONTENT_STRING &&
++				item->type != CSS_COMPUTED_CONTENT_URI &&
++				item->type != CSS_COMPUTED_CONTENT_ATTR)
++			return false;
++	}
++	return true;
++}
++
+ /** Where an element's boxes go among its parent box pb's children:
+  * before the box of its next sibling with one, which has to be one of
+  * pb's own, or at the end (next_box NULL). False if neither will do:
+@@ -3245,9 +3263,21 @@ static bool show_place(html_content *c, dom_node *n, struct box *pb,
+ 		}
+ 	} else if (pb->styles != NULL &&
+ 			pb->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL) {
+-		/* the parent's ::after would come before it */
+-		show_why = "its parent has ::after content";
+-		return false;
++		/* before the parent's ::after, when that is a block of its
++		 * own at the end (a clearfix), showing nothing that counts:
++		 * the Guardian's page was built again when a hidden ad slot
++		 * was shown in a parent with ::after content, 3.5 s
++		 * (VitaSurf) */
++		const css_computed_style *after =
++			pb->styles->styles[CSS_PSEUDO_ELEMENT_AFTER];
++
++		if (pb->last == NULL || pb->last->node != NULL ||
++				pb->last->style != after ||
++				!show_after_plain(after)) {
++			show_why = "its parent has ::after content";
++			return false;
++		}
++		next_box = pb->last;
+ 	}
+ 	*next_box_out = next_box;
+ 	return true;
+@@ -3736,6 +3766,65 @@ static bool rebuild_subtree_counts(const struct box *b, unsigned *count)
+ 	return rebuild_subtree_unsettled(b, count, &k);
+ }
+ 
++/**
++ * Whether new content in an element that is not displayed changes no
++ * boxes (VitaSurf): a script's text runs, a sheet's is parsed, a title
++ * is the window's, and each has handlers of its own that do it; a
++ * head's new children are those, or links and metadata, whose own
++ * handlers do the same, but for a <base>, which every link resolves
++ * against. Build 751's log gave "content that is more than boxes" as
++ * why eight rebuilds were made, 4.6 s in all.
++ */
++static bool rebuild_text_unshown(dom_node *n)
++{
++	static const char *const tags[] = {
++		"SCRIPT", "STYLE", "TITLE", "NOSCRIPT", "TEMPLATE", "HEAD",
++	};
++	dom_string *name = NULL, *ns = NULL;
++	dom_node *child = NULL, *next;
++	bool quiet = false, html;
++	size_t i;
++
++	if (dom_node_get_namespace(n, &ns) != DOM_NO_ERR || ns == NULL)
++		return false;
++	html = dom_string_isequal(ns, corestring_dom_html_namespace);
++	dom_string_unref(ns);
++	if (!html || dom_node_get_node_name(n, &name) != DOM_NO_ERR ||
++			name == NULL)
++		return false;
++	for (i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
++		if (strcasecmp(dom_string_data(name), tags[i]) == 0) {
++			quiet = true;
++			break;
++		}
++	}
++	if (!quiet || strcasecmp(dom_string_data(name), "HEAD") != 0) {
++		dom_string_unref(name);
++		return quiet;
++	}
++	dom_string_unref(name);
++
++	if (dom_node_get_first_child(n, &child) != DOM_NO_ERR)
++		return false;
++	while (child != NULL && quiet) {
++		name = NULL;
++		if (dom_node_get_node_name(child, &name) == DOM_NO_ERR &&
++				name != NULL) {
++			if (strcasecmp(dom_string_data(name), "BASE") == 0)
++				quiet = false;
++			dom_string_unref(name);
++		}
++		next = NULL;
++		if (dom_node_get_next_sibling(child, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(child);
++		child = next;
++	}
++	if (child != NULL)
++		dom_node_unref(child);
++	return quiet;
++}
++
+ /** Elements whose text is more than boxes: a sheet, a script, a title,
+  * a form control's value or options, markup parsed elsewhere. */
+ static bool rebuild_text_special(dom_node *n)
+@@ -3919,6 +4008,10 @@ enum box_restyle box_rebuild_content(html_content *c, dom_node *n,
+ 		dom_node_unref(e);
+ 		return BOX_RESTYLE_SAME;	/* in a fragment */
+ 	}
++	if (box_for_node(e) == NULL && rebuild_text_unshown(e)) {
++		dom_node_unref(e);
++		return BOX_RESTYLE_SAME;
++	}
+ 	if (rebuild_text_special(e)) {
+ 		dom_node_unref(e);
+ 		restyle_why = "content that is more than boxes";
+@@ -4123,6 +4216,51 @@ static bool restyle_results_equal(const css_select_results *a,
+ 	return true;
+ }
+ 
++/**
++ * An image's size given in its style, for which it does not wait for
++ * its own (VitaSurf): box_image and the inline SVG set REPLACE_DIM from
++ * the style when they are built, and a restyle that gave it a width or
++ * took one away left the flag as it was.
++ */
++static bool restyle_is_image(const struct box *box, dom_node *n)
++{
++	dom_string *name = NULL, *ns = NULL;
++	bool image = false;
++
++	if (box->object == NULL || (box->flags & IS_REPLACED) == 0 ||
++			n == NULL)
++		return false;
++	if (dom_node_get_namespace(n, &ns) == DOM_NO_ERR && ns != NULL) {
++		image = !dom_string_isequal(ns,
++				corestring_dom_html_namespace);
++		dom_string_unref(ns);
++	}
++	if (!image && dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
++			name != NULL) {
++		image = strcasecmp(dom_string_data(name), "IMG") == 0;
++		dom_string_unref(name);
++	}
++	return image;
++}
++
++static void restyle_replace_dim(struct box *box, dom_node *n)
++{
++	enum css_width_e wtype;
++	enum css_height_e htype;
++	css_fixed value = 0;
++	css_unit wunit = CSS_UNIT_PX, hunit = CSS_UNIT_PX;
++
++	if (box->style == NULL || !restyle_is_image(box, n))
++		return;
++	wtype = css_computed_width(box->style, &value, &wunit);
++	htype = css_computed_height(box->style, &value, &hunit);
++	if (wtype == CSS_WIDTH_SET && wunit != CSS_UNIT_PCT &&
++			htype == CSS_HEIGHT_SET && hunit != CSS_UNIT_PCT)
++		box->flags |= REPLACE_DIM;
++	else
++		box->flags &= ~REPLACE_DIM;
++}
++
+ /*
+  * Whether new styles build the same boxes as the old (VitaSurf), so that
+  * laying the tree out again is all a change of size needs. Box
+@@ -4146,7 +4284,10 @@ static bool restyle_same_boxes(const html_content *c, const struct box *box,
+ 	}
+ 	if (sa == NULL || sb == NULL)
+ 		return sa == sb;
+-	if ((box->flags & IS_REPLACED) != 0) {
++	/* what a replaced element was built with from its size, but for
++	 * an image's, which a restyle keeps (restyle_replace_dim) */
++	if ((box->flags & IS_REPLACED) != 0 &&
++			!restyle_is_image(box, box->node)) {
+ 		css_fixed va = 0, vb = 0;
+ 		css_unit ua = CSS_UNIT_PX, ub = CSS_UNIT_PX;
+ 
+@@ -4235,7 +4376,8 @@ static const char *restyle_boxes_detail(const struct box *box,
+ 			what = "list-style-type";
+ 		else if (!css_computed_style_same_boxes(sa, sb))
+ 			what = "another property the boxes are built from";
+-		else if ((box->flags & IS_REPLACED) != 0)
++		else if ((box->flags & IS_REPLACED) != 0 &&
++				!restyle_is_image(box, box->node))
+ 			what = "a replaced element's width or height";
+ 		else
+ 			what = "the overflow of the root or the body";
+@@ -4521,6 +4663,7 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 	box->style = fresh->styles[CSS_PSEUDO_ELEMENT_NONE];
+ 	if (box == c->layout)
+ 		c->unit_len_ctx.root_style = box->style;
++	restyle_replace_dim(box, n);
+ 	if (reflow) {
+ 		struct box *b;
+ 
+@@ -4560,6 +4703,54 @@ static enum box_restyle restyle_worse(enum box_restyle a, enum box_restyle b)
+ 	return a > b ? a : b;
+ }
+ 
++/* exported interface documented in html/box_construct.h */
++bool box_child_quiet(html_content *c, dom_node *e, dom_node *child)
++{
++	struct box_construct_props props;
++	const css_computed_style *root_style, *style;
++	css_select_results *fresh;
++	dom_node *parent = NULL;
++	dom_node_type type;
++	bool in, none;
++
++	if (c->layout == NULL || box_for_node(e) == NULL ||
++			nscss_children_ordered(e) ||
++			dom_node_get_node_type(child, &type) != DOM_NO_ERR)
++		return false;
++	if (type == DOM_COMMENT_NODE ||
++			type == DOM_PROCESSING_INSTRUCTION_NODE)
++		return true;
++	if (type != DOM_ELEMENT_NODE)
++		return false;
++
++	if (dom_node_get_parent_node(child, &parent) != DOM_NO_ERR)
++		return false;
++	in = parent == e;
++	if (parent != NULL)
++		dom_node_unref(parent);
++	if (!in) {
++		/* taken out: nothing of it was drawn */
++		return box_for_node(child) == NULL;
++	}
++	if (box_for_node(child) != NULL)
++		return false;
++
++	/* put in: not drawn, and nothing else's style asks about it */
++	box_extract_properties(c, child, &props);
++	if (props.parent_style == NULL)
++		return false;
++	root_style = props.node_is_root ? NULL : c->layout->style;
++	nscss_clear_node_data(child);
++	fresh = box_get_style(c, props.parent_style, root_style, child);
++	if (fresh == NULL)
++		return false;
++	style = fresh->styles[CSS_PSEUDO_ELEMENT_NONE];
++	none = style != NULL && ns_computed_display(style,
++			props.node_is_root) == CSS_DISPLAY_NONE;
++	css_select_results_destroy(fresh);
++	return none;
++}
++
+ /* exported interface documented in html/box_construct.h */
+ enum box_restyle box_restyle(html_content *c, dom_node *n, bool subtree,
+ 		unsigned *budget)
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index 4e5d7461c..3a0c78829 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -179,6 +179,21 @@ enum box_restyle {
+  *                 one, and none left is a BOX_RESTYLE_LAYOUT
+  * \return what the page needs now
+  */
++/**
++ * Whether one child put into an element, or taken out, needs nothing
++ * built (VitaSurf): a comment; an element put in that is not displayed;
++ * an element taken out that had no boxes. Never when a selector has
++ * asked about the order or presence of the element's children
++ * (nscss_children_ordered), as a sibling's style may change.
++ *
++ * \param c      the document
++ * \param e      the element whose children changed
++ * \param child  the child put in or taken out
++ * \return true if nothing need be built or restyled
++ */
++bool box_child_quiet(struct html_content *c, struct dom_node *e,
++		struct dom_node *child);
++
+ /**
+  * Build again the boxes around a text node whose text a script changed,
+  * or an element whose children it changed: those of the nearest block
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 481ceb469..4778c22ac 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -4730,6 +4730,90 @@ static bool html_reach_hit(html_content *c, uint32_t reach,
+ 	return false;
+ }
+ 
++/**
++ * Where the :has() pseudo-classes are of the sheets a change reaches
++ * through :has() (VitaSurf): their css_has_shape bits together.
++ */
++static uint32_t html_reach_has_shape(html_content *c,
++		const struct html_reach_change *ch)
++{
++	uint32_t i, k, shape = 0;
++
++	for (i = 0; i < c->stylesheet_count; i++) {
++		struct hlcache_handle *h = c->stylesheets[i].sheet;
++		struct nscss_import *imports;
++		const css_stylesheet *s;
++		uint32_t ni = 0;
++
++		if (!dynamic_sheet_ready(h))
++			continue;
++		s = nscss_get_stylesheet(h);
++		if (html_reach_sheet_hit(s, CSS_REACH_HAS, ch))
++			shape |= css_stylesheet_has_shape(s);
++		imports = nscss_get_imports(h, &ni);
++		for (k = 0; k < ni; k++) {
++			if (!dynamic_sheet_ready(imports[k].c))
++				continue;
++			s = nscss_get_stylesheet(imports[k].c);
++			if (html_reach_sheet_hit(s, CSS_REACH_HAS, ch))
++				shape |= css_stylesheet_has_shape(s);
++		}
++	}
++	return shape;
++}
++
++/**
++ * Restyle what a :has() in the subject's compound can answer
++ * differently for a change to an element (VitaSurf): its ancestors,
++ * and with an argument that looks at later siblings its earlier ones,
++ * each alone, with what inherits a style that changed.
++ */
++static enum box_restyle html_restyle_has(html_content *c, dom_node *n,
++		bool sibling, unsigned *budget)
++{
++	enum box_restyle result = BOX_RESTYLE_SAME, r;
++	dom_node *at, *next = NULL;
++	dom_node_type type;
++
++	if (sibling) {
++		if (dom_node_get_previous_sibling(n, &at) != DOM_NO_ERR)
++			return BOX_RESTYLE_LAYOUT;
++		while (at != NULL && result != BOX_RESTYLE_LAYOUT) {
++			if (dom_node_get_node_type(at, &type) == DOM_NO_ERR &&
++					type == DOM_ELEMENT_NODE) {
++				r = box_restyle(c, at, false, budget);
++				if (r > result)
++					result = r;
++			}
++			if (dom_node_get_previous_sibling(at, &next) !=
++					DOM_NO_ERR)
++				next = NULL;
++			dom_node_unref(at);
++			at = next;
++		}
++		if (at != NULL)
++			dom_node_unref(at);
++	}
++
++	if (dom_node_get_parent_node(n, &at) != DOM_NO_ERR)
++		return BOX_RESTYLE_LAYOUT;
++	while (at != NULL && result != BOX_RESTYLE_LAYOUT) {
++		if (dom_node_get_node_type(at, &type) != DOM_NO_ERR ||
++				type != DOM_ELEMENT_NODE)
++			break;
++		r = box_restyle(c, at, false, budget);
++		if (r > result)
++			result = r;
++		if (dom_node_get_parent_node(at, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(at);
++		at = next;
++	}
++	if (at != NULL)
++		dom_node_unref(at);
++	return result;
++}
++
+ /** Whether a class list holds a class, as whitespace separated words. */
+ static bool html_class_in(const char *list, size_t list_len,
+ 		const char *word, size_t len)
+@@ -5044,6 +5128,73 @@ static bool html_relink(html_content *c, dom_node *n, struct box *box)
+ 	return true;
+ }
+ 
++/** Whether an element is an iframe or has one inside it. */
++static bool html_subtree_has_iframe(dom_node *n)
++{
++	dom_node *child = NULL, *next;
++	dom_string *name = NULL;
++	dom_node_type type;
++	bool found = false;
++
++	if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++			type != DOM_ELEMENT_NODE)
++		return false;
++	if (dom_node_get_node_name(n, &name) == DOM_NO_ERR && name != NULL) {
++		found = strcasecmp(dom_string_data(name), "IFRAME") == 0;
++		dom_string_unref(name);
++	}
++	if (found || dom_node_get_first_child(n, &child) != DOM_NO_ERR)
++		return found;
++	while (child != NULL && !found) {
++		found = html_subtree_has_iframe(child);
++		next = NULL;
++		if (dom_node_get_next_sibling(child, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(child);
++		child = next;
++	}
++	if (child != NULL)
++		dom_node_unref(child);
++	return found;
++}
++
++/** Whether a box in a tree holds an address for following it. */
++static bool html_box_holds_href(struct box *b, nsurl *u)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->href != NULL && nsurl_compare(b->href, u,
++				NSURL_COMPLETE))
++			return true;
++		if (b->list_marker != NULL &&
++				html_box_holds_href(b->list_marker, u))
++			return true;
++		if (b->children != NULL && html_box_holds_href(b->children, u))
++			return true;
++	}
++	return false;
++}
++
++/*
++ * A link with no box, not displayed, given another href (VitaSurf):
++ * nothing holds the address it had, so nothing but its style can
++ * change, unless a box inside it does (display: contents), which the
++ * address it had finds. A carousel's hidden slides, and a menu's
++ * hidden links, had the whole page built again for each change.
++ */
++static bool html_relink_unboxed(html_content *c, dom_string *old)
++{
++	nsurl *was = NULL;
++	bool held;
++
++	if (old == NULL || !box_extract_link(c, old, c->base_url, &was))
++		return false;
++	if (was == NULL)
++		return false;
++	held = html_box_holds_href(c->layout, was);
++	nsurl_unref(was);
++	return !held;
++}
++
+ /* exported interface documented in html/private.h */
+ bool html_restyle_attrs(html_content *c,
+ 		const struct html_attr_change *changes, unsigned n,
+@@ -5056,7 +5207,7 @@ bool html_restyle_attrs(html_content *c,
+ 	/* what a paint-only change has to draw again: the changed
+ 	 * elements, unless a sibling selector reached past them */
+ 	struct rect area = { 1, 1, 0, 0 };
+-	bool area_whole = false;
++	bool area_whole = false, frames = false;
+ 
+ 	why[0] = '\0';
+ 	if (c->layout == NULL || c->bctx == NULL || c->reflowing ||
+@@ -5074,10 +5225,26 @@ bool html_restyle_attrs(html_content *c,
+ 		dom_string *tag = NULL, *now = NULL;
+ 		struct box *box;
+ 		bool special = false, is_img = false, is_source = false;
+-		bool subtree, sibs, deep;
++		bool subtree, sibs, deep, has;
++		uint32_t shape;
+ 		size_t t;
+ 
+ 		if (ch->name == NULL) {
++			/* A child put in that is not drawn, or one taken out
++			 * that was not, builds nothing: stackoverflow.com's
++			 * page was built again three times, 1.2 to 1.6 s, for
++			 * new content with no block around it to build on
++			 * its own, the body's children having none
++			 * (VitaSurf). */
++			if (ch->child != NULL &&
++					box_child_quiet(c, ch->node, ch->child)) {
++				/* a hidden frame still loads, which only a
++				 * rebuild had started */
++				if (!frames && html_subtree_has_iframe(
++						ch->child))
++					frames = true;
++				continue;
++			}
+ 			/* new text, or new children: the boxes around */
+ 			r = box_rebuild_content(c, ch->node, built, &n_built,
+ 					sizeof(built) / sizeof(built[0]));
+@@ -5110,9 +5277,12 @@ bool html_restyle_attrs(html_content *c,
+ 		 * again for it: cnn.com's log gave "name on <IFRAME>" as why
+ 		 * its page was rebuilt, and its rebuilds after load took 2.4
+ 		 * to 3.1 s each (VitaSurf). */
+-		if (box != NULL && tag != NULL && box->iframe != NULL &&
++		if (tag != NULL &&
+ 				strcasecmp(dom_string_data(tag), "IFRAME") == 0 &&
+ 				html_iframe_attr_quiet(name)) {
++			/* one with no box may have a frame all the same;
++			 * one with no frame yet takes the name when its
++			 * frame is made */
+ 			if (strcasecmp(name, "name") == 0) {
+ 				struct content_html_iframe *f;
+ 				dom_string *v = NULL;
+@@ -5122,8 +5292,10 @@ bool html_restyle_attrs(html_content *c,
+ 						ch->name, &v) != DOM_NO_ERR)
+ 					v = NULL;
+ 				nv = v != NULL ? dom_string_data(v) : NULL;
+-				browser_window_iframe_rename(box->iframe, nv);
+-				for (f = c->iframe; f != NULL; f = f->next) {
++				browser_window_iframe_node_rename(c->bw,
++						ch->node, nv);
++				for (f = c->iframe; box != NULL && f != NULL;
++						f = f->next) {
+ 					if (f->box == box)
+ 						f->name = nv != NULL ?
+ 							talloc_strdup(c->bctx,
+@@ -5134,6 +5306,17 @@ bool html_restyle_attrs(html_content *c,
+ 			}
+ 			special = false;
+ 		}
++		/* A script's or a link's attributes draw nothing: a script
++		 * that went in empty is run when it gets a src, and a
++		 * link's sheet is taken in or dropped when its rel or media
++		 * change, by the DOMAttrModified handler; the rest count
++		 * only when a script is prepared. A script's async, type
++		 * and src had the whole page built again, 0.4 to 0.6 s
++		 * each time in build 751's log (VitaSurf). */
++		if (tag != NULL && (strcasecmp(dom_string_data(tag),
++				"SCRIPT") == 0 ||
++				strcasecmp(dom_string_data(tag), "LINK") == 0))
++			special = false;
+ 		/* A text field's value, which its control takes from the
+ 		 * DOM as it changes (html_texty_element_update) and which
+ 		 * sizes nothing: a script setting a field's value had the
+@@ -5146,6 +5329,17 @@ bool html_restyle_attrs(html_content *c,
+ 				 box->gadget->type == GADGET_PASSWORD ||
+ 				 box->gadget->type == GADGET_HIDDEN))
+ 			special = false;
++		/* An image's size, border and spacing are hints its style
++		 * takes when it is selected again (restyle_replace_dim):
++		 * stackoverflow.com's page was built again for a width an
++		 * image was given, 1.2 s (VitaSurf). */
++		if (is_img && (strcasecmp(name, "width") == 0 ||
++				strcasecmp(name, "height") == 0 ||
++				strcasecmp(name, "border") == 0 ||
++				strcasecmp(name, "hspace") == 0 ||
++				strcasecmp(name, "vspace") == 0 ||
++				strcasecmp(name, "align") == 0))
++			special = false;
+ 		/* a link given another address keeps its boxes, which take
+ 		 * the new one (VitaSurf) */
+ 		if (box != NULL && tag != NULL &&
+@@ -5153,6 +5347,11 @@ bool html_restyle_attrs(html_content *c,
+ 				strcasecmp(dom_string_data(tag), "A") == 0 &&
+ 				html_relink(c, ch->node, box))
+ 			special = false;
++		if (box == NULL && tag != NULL &&
++				strcasecmp(name, "href") == 0 &&
++				strcasecmp(dom_string_data(tag), "A") == 0 &&
++				html_relink_unboxed(c, ch->old))
++			special = false;
+ 		if (html_node_is_svg(ch->node) ||
+ 				strcasecmp(name, "slot") == 0 ||
+ 				(special && !html_attr_any(name) &&
+@@ -5199,9 +5398,17 @@ bool html_restyle_attrs(html_content *c,
+ 			rc.ids[1] = now;
+ 		}
+ 
+-		if (html_reach_hit(c, CSS_REACH_HAS, &rc)) {
+-			ATTR_WHY("%s on <%s>, which a :has() selector asks "
+-					"about", name, tag != NULL ?
++		/* A :has() asking about it is answered again by the
++		 * element's ancestors, or its earlier siblings, and when it
++		 * is in the subject's compound only their own styles change:
++		 * cnn.com's page had been built again for a style attribute
++		 * a :has() asked about, 2.5 to 2.7 s each time (VitaSurf). */
++		has = html_reach_hit(c, CSS_REACH_HAS, &rc);
++		shape = has ? html_reach_has_shape(c, &rc) : 0;
++		if (has && (shape & CSS_HAS_SHAPE_OUTER) != 0) {
++			ATTR_WHY("%s on <%s>, which a :has() left of a "
++					"combinator asks about", name,
++					tag != NULL ?
+ 					dom_string_data(tag) : "?");
+ 			res = BOX_RESTYLE_LAYOUT;
+ 		} else {
+@@ -5220,6 +5427,15 @@ bool html_restyle_attrs(html_content *c,
+ 				if (r != BOX_RESTYLE_SAME)
+ 					area_whole = true;
+ 			}
++			if (has && res != BOX_RESTYLE_LAYOUT) {
++				r = html_restyle_has(c, ch->node,
++						(shape & CSS_HAS_SHAPE_SIBLING)
++						!= 0, &budget);
++				if (r > res)
++					res = r;
++				if (r != BOX_RESTYLE_SAME)
++					area_whole = true;
++			}
+ 			if (res == BOX_RESTYLE_LAYOUT)
+ 				ATTR_WHY("%s on <%s>: %s", name,
+ 						tag != NULL ?
+@@ -5301,6 +5517,8 @@ bool html_restyle_attrs(html_content *c,
+ #undef ATTR_WHY
+ 	while (n_built > 0)
+ 		dom_node_unref(built[--n_built]);
++	if (frames && res != BOX_RESTYLE_LAYOUT)
++		browser_window_start_hidden_iframes(c->bw);
+ 
+ 	if (res == BOX_RESTYLE_REFLOW && !html_reflow_now(c)) {
+ 		snprintf(why, why_len, "the page could not be laid out now");
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 8df17cac9..2993b11c1 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -652,6 +652,9 @@ struct html_attr_change {
+ 	/** its value before the first change since the last layout, or
+ 	 * NULL if it had none */
+ 	struct dom_string *old;
++	/** for new children, the one child put in or taken out, when it
++	 * is one, or NULL (VitaSurf) */
++	struct dom_node *child;
+ };
+ 
+ /**
+diff --git a/desktop/frames.c b/desktop/frames.c
+index 0bba994fb..37095482a 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -684,6 +684,14 @@ static void start_hidden_iframes(struct browser_window *bw)
+ 	}
+ }
+ 
++/* exported function documented in desktop/frames.h */
++void browser_window_start_hidden_iframes(struct browser_window *bw)
++{
++	if (bw != NULL) {
++		start_hidden_iframes(bw);
++	}
++}
++
+ /* exported function documented in desktop/frames.h */
+ void browser_window_detach_iframes(struct browser_window *bw)
+ {
+@@ -1472,3 +1480,20 @@ void browser_window_iframe_rename(struct browser_window *bw, const char *name)
+ 	free(bw->name);
+ 	bw->name = copy;
+ }
++
++/* exported function documented in desktop/frames.h */
++void browser_window_iframe_node_rename(struct browser_window *bw,
++				       struct dom_node *node, const char *name)
++{
++	int i;
++
++	if (bw == NULL)
++		return;
++	for (i = 0; i < bw->iframe_count; i++) {
++		if (bw->iframes[i] != NULL &&
++		    bw->iframes[i]->frame_node == node) {
++			browser_window_iframe_rename(bw->iframes[i], name);
++			return;
++		}
++	}
++}
+diff --git a/desktop/frames.h b/desktop/frames.h
+index cb379f231..d695db7f7 100644
+--- a/desktop/frames.h
++++ b/desktop/frames.h
+@@ -78,12 +78,27 @@ void browser_window_detach_iframes(struct browser_window *bw);
+  */
+ nserror browser_window_rebuild_iframes(struct browser_window *bw);
+ 
++/**
++ * Load the iframes of bw's page that have no window and no box, as a
++ * rebuild of its layout does (VitaSurf): for one put into the page
++ * not displayed, which needs no layout.
++ */
++void browser_window_start_hidden_iframes(struct browser_window *bw);
++
+ /**
+  * Give an iframe's browsing context the name its element now has, or
+  * none (VitaSurf): what a link's target finds it by.
+  */
+ void browser_window_iframe_rename(struct browser_window *bw, const char *name);
+ 
++/**
++ * The same for the frame of an iframe element of bw's page, if it has
++ * one (VitaSurf): one with no box, not displayed or made by script
++ * before the boxes had it, has a window as well.
++ */
++void browser_window_iframe_node_rename(struct browser_window *bw,
++				       struct dom_node *node, const char *name);
++
+ /**
+  * The window of an iframe element, made now if it has none yet
+  * (VitaSurf). Script can reach a frame's window as soon as its element
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index cc542cf37..921d8b766 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -396,6 +396,7 @@ CORESTRING_DOM_STRING(__ns_key_file_name_node_data);
+ CORESTRING_DOM_STRING(__ns_key_image_coords_node_data);
+ CORESTRING_DOM_STRING(__ns_key_html_content_data);
+ CORESTRING_DOM_STRING(__ns_key_canvas_node_data);
++CORESTRING_DOM_STRING(__ns_key_children_ordered);
+ 
+ /* unusual DOM strings */
+ CORESTRING_DOM_VALUE(text_javascript, "text/javascript");

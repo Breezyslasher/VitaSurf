@@ -2373,7 +2373,8 @@ static void tree_name(struct dom_node *n, char *out, size_t size)
 }
 
 static void attr_journal_add(jsthread *thread, struct dom_node *node,
-			     dom_string *name, dom_string *old, bool slots);
+			     dom_string *name, dom_string *old, bool slots,
+			     struct dom_node *child);
 
 /* Whether a node is in the thread's document. */
 /* A shadow root's host, referenced, or NULL (VitaSurf). */
@@ -2552,10 +2553,12 @@ static void mark_tree_dirty(JSContext *ctx, const char *what,
 		vita_id_gen++;
 		thread->dom_dirty = true;
 		if (in) {
-			attr_journal_add(thread, parent, NULL, NULL, slots);
+			attr_journal_add(thread, parent, NULL, NULL, slots,
+					 child);
 		}
 		if (from_in) {
-			attr_journal_add(thread, from, NULL, NULL, slots);
+			attr_journal_add(thread, from, NULL, NULL, slots,
+					 child);
 		}
 		if (from != NULL) {
 			dom_node_unref(from);
@@ -2596,6 +2599,9 @@ static void attr_journal_clear(jsthread *thread)
 		struct html_attr_change *c = &thread->attr_changes[i];
 
 		dom_node_unref(c->node);
+		if (c->child != NULL) {
+			dom_node_unref(c->child);
+		}
 		if (c->name != NULL) {
 			dom_string_unref(c->name);
 		}
@@ -2610,9 +2616,12 @@ static void attr_journal_clear(jsthread *thread)
 /* Note an attribute change for html_restyle_attrs (VitaSurf). The first
    change to an element's attribute since the last layout keeps the value
    it had then, which is what a changed class list is worked out from.
-   A NULL name notes new text in the text node node. */
+   A NULL name notes new text in the text node node, or new children of
+   the element node: child, when it is one child put in or taken out,
+   and NULL when more than one has changed (VitaSurf). */
 static void attr_journal_add(jsthread *thread, struct dom_node *node,
-			     dom_string *name, dom_string *old, bool slots)
+			     dom_string *name, dom_string *old, bool slots,
+			     struct dom_node *child)
 {
 	struct html_attr_change *c;
 	unsigned i;
@@ -2625,6 +2634,11 @@ static void attr_journal_add(jsthread *thread, struct dom_node *node,
 		if (c->node == node && (name == NULL ? c->name == NULL :
 		    c->name != NULL && dom_string_isequal(c->name, name))) {
 			thread->attr_slots = thread->attr_slots || slots;
+			if (c->child != NULL && c->child != child) {
+				/* more than one */
+				dom_node_unref(c->child);
+				c->child = NULL;
+			}
 			return;
 		}
 	}
@@ -2650,6 +2664,7 @@ static void attr_journal_add(jsthread *thread, struct dom_node *node,
 	c->node = dom_node_ref(node);
 	c->name = name != NULL ? dom_string_ref(name) : NULL;
 	c->old = old != NULL ? dom_string_ref(old) : NULL;
+	c->child = child != NULL && !slots ? dom_node_ref(child) : NULL;
 	thread->attr_slots = thread->attr_slots || slots;
 }
 
@@ -2665,9 +2680,14 @@ static void mark_attr_dirty(JSContext *ctx, struct dom_node *node,
 	if (name == NULL || strcasecmp(name, "id") == 0) {
 		vita_id_gen++;
 	}
+	/* an element out of the page has no boxes, and is noted as new
+	   content when it goes in: a loader setting a new iframe's srcdoc
+	   before putting it in had the page built again (VitaSurf) */
 	if (thread != NULL) {
 		thread->dom_dirty = true;
-		attr_journal_add(thread, node, key, old, false);
+		if (node_in_page(thread, node)) {
+			attr_journal_add(thread, node, key, old, false, NULL);
+		}
 	}
 }
 
@@ -2687,7 +2707,10 @@ static void mark_text_dirty(JSContext *ctx, struct dom_node *node,
 	vita_dom_gen++;
 	if (thread != NULL) {
 		thread->dom_dirty = true;
-		attr_journal_add(thread, node, NULL, NULL, false);
+		if (node_in_page(thread, node)) {
+			attr_journal_add(thread, node, NULL, NULL, false,
+					 NULL);
+		}
 	}
 }
 
@@ -16641,7 +16664,8 @@ static JSValue win_vita_popover(JSContext *ctx, JSValueConst this_val,
 				value = NULL;
 			}
 			thread->dom_dirty = true;
-			attr_journal_add(thread, node, attr, value, false);
+			attr_journal_add(thread, node, attr, value, false,
+					 NULL);
 			if (value != NULL) {
 				dom_string_unref(value);
 			}

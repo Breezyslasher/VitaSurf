@@ -1,0 +1,199 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 450581d..b65be78 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -268,6 +268,20 @@ typedef struct css_select_handler {
+ 	 * NULL here keeps every rule to every tree.
+ 	 */
+ 	css_error (*node_tree_scope)(void *pw, void *node, void **scope);
++
++	/**
++	 * A selector asked about \a node's place among its siblings, or
++	 * about its children (VitaSurf): with \a children false, a
++	 * sibling combinator or a pseudo-class of position tested \a node,
++	 * so a child put into or taken from its parent can change what
++	 * matches there; with \a children true, :empty or :has() looked
++	 * at its children, so one put into or taken from \a node can. A
++	 * client that changes the tree in place learns from it which
++	 * insertions need more than the new element selected. NULL when
++	 * the client does not ask. Style sharing never calls it: a
++	 * sibling shares only what it would have been given.
++	 */
++	void (*note_order)(void *pw, void *node, bool children);
+ } css_select_handler;
+ 
+ /** How many attribute names a node can name before every bucket is
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index 2fce582..a6b1a64 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -274,6 +274,27 @@ enum css_reach {
+ void css_stylesheet_reach_keys(const css_stylesheet *sheet, uint32_t reach,
+ 		const css_dynamic_key **keys, uint32_t *n, bool *any);
+ 
++/*
++ * Where a sheet's :has() pseudo-classes are (VitaSurf), for what a
++ * change CSS_REACH_HAS keys on can restyle. With neither bit, each
++ * :has() is in the subject's compound and looks at descendants or
++ * children, so only the changed element's ancestors can answer it
++ * differently, and only their own styles, and what inherits them,
++ * change.
++ */
++enum css_has_shape {
++	/** a :has() left of a combinator: ".a:has(.b) .c" */
++	CSS_HAS_SHAPE_OUTER = 1,
++	/** an argument that looks at later siblings: ":has(+ .b)" */
++	CSS_HAS_SHAPE_SIBLING = 2
++};
++
++/**
++ * \param sheet  The stylesheet
++ * \return the css_has_shape bits of its :has() pseudo-classes
++ */
++uint32_t css_stylesheet_has_shape(const css_stylesheet *sheet);
++
+ /**
+  * Read one of those (VitaSurf).
+  *
+diff --git a/src/select/select.c b/src/select/select.c
+index f314302..108b28b 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -153,6 +153,14 @@ typedef struct css_select_font_faces_state {
+ 	css_select_font_faces_list author_font_faces;
+ } css_select_font_faces_state;
+ 
++/** Tell the client a selector looked at node's siblings or children. */
++static inline void note_order(const css_select_state *state, void *node,
++		bool children)
++{
++	if (state->handler->note_order != NULL && node != NULL)
++		state->handler->note_order(state->pw, node, children);
++}
++
+ /**
+  * CSS rule source
+  */
+@@ -4575,6 +4583,7 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 				return error;
+ 			break;
+ 		case CSS_COMBINATOR_SIBLING:
++			note_order(state, n, false);
+ 			error = state->handler->named_sibling_node(state->pw,
+ 					n, &selector->data.qname, &n);
+ 			if (error != CSS_OK)
+@@ -4585,6 +4594,7 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 			}
+ 			break;
+ 		case CSS_COMBINATOR_GENERIC_SIBLING:
++			note_order(state, n, false);
+ 			error = state->handler->named_generic_sibling_node(
+ 					state->pw, n, &selector->data.qname,
+ 					&n);
+@@ -4738,6 +4748,7 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
+ 			break;
+ 		case CSS_COMBINATOR_SIBLING:
+ 		case CSS_COMBINATOR_GENERIC_SIBLING:
++			note_order(state, n, false);
+ 			error = state->handler->sibling_node(state->pw, n, &n);
+ 			if (error != CSS_OK)
+ 				return error;
+@@ -5465,6 +5476,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 
+ 	if (h->first_child_node == NULL || h->next_sibling_node == NULL)
+ 		return CSS_OK;
++	note_order(state, node, true);
+ 
+ 	for (; sub != NULL; sub = sub->combinator) {
+ 		void *n = NULL;
+@@ -5476,6 +5488,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 				state->node_data->flags |=
+ 						CSS_NODE_FLAGS_TAINT_SIBLING;
+ 			}
++			note_order(state, node, false);
+ 			error = h->next_sibling_node(state->pw, node, &n);
+ 			if (error != CSS_OK)
+ 				return error;
+@@ -5526,6 +5539,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 
+ 				/* Down, else along, else up until there is
+ 				 * an along, stopping at the subject. */
++				note_order(state, n, true);
+ 				error = h->first_child_node(state->pw, n,
+ 						&next);
+ 				if (error != CSS_OK)
+@@ -5693,6 +5707,7 @@ static css_error match_nth_of(css_select_ctx *ctx, void *node,
+ 	if (head == NULL || h->sibling_node == NULL ||
+ 			h->next_sibling_node == NULL)
+ 		return CSS_OK;
++	note_order(state, node, false);
+ 
+ 	error = match_any_compound(ctx, node, head->combinator, state, match);
+ 	if (error != CSS_OK || *match == false)
+@@ -5796,6 +5811,11 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 				a = detail->value.nth.a;
+ 				b = detail->value.nth.b;
+ 			}
++			if (test <= CSS_SELF_ONLY_OF_TYPE ||
++					test >= CSS_SELF_NTH_CHILD)
++				note_order(state, node, false);
++			else if (test == CSS_SELF_EMPTY)
++				note_order(state, node, true);
+ 			if (node == state->node) {
+ 				/*
+ 				 * Answered once per selection and kept
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index e8ee746..b81990b 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -1218,6 +1218,12 @@ void css_stylesheet_reach_keys(const css_stylesheet *sheet, uint32_t reach,
+ 	*any = sheet->dynamic_keys[4 + reach].any;
+ }
+ 
++/* exported function documented in libcss/stylesheet.h */
++uint32_t css_stylesheet_has_shape(const css_stylesheet *sheet)
++{
++	return sheet != NULL ? sheet->has_shape : 0;
++}
++
+ uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet)
+ {
+ 	return sheet == NULL ? 0 : sheet->n_gaps;
+@@ -2357,8 +2363,22 @@ static void reach_compound(css_stylesheet *sheet,
+ 			const css_selector *alt;
+ 			int inner = set;
+ 
+-			if (strcasecmp(n, "has") == 0)
++			if (strcasecmp(n, "has") == 0) {
+ 				inner = 4 + CSS_REACH_HAS;
++				/* left of a combinator, its answer reaches
++				 * past the element it is asked of */
++				if (set >= 0)
++					sheet->has_shape |= CSS_HAS_SHAPE_OUTER;
++				for (alt = d->value.selector; alt != NULL;
++						alt = alt->combinator) {
++					if (alt->data.comb ==
++						CSS_COMBINATOR_SIBLING ||
++					    alt->data.comb ==
++						CSS_COMBINATOR_GENERIC_SIBLING)
++						sheet->has_shape |=
++							CSS_HAS_SHAPE_SIBLING;
++				}
++			}
+ 			else if (strncasecmp(n, "nth-", 4) == 0)
+ 				inner = 4 + CSS_REACH_SIBLINGS;
+ 			for (alt = d->value.selector; alt != NULL;
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index ce0351b..e50afb0 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -324,6 +324,9 @@ struct css_stylesheet {
+ 	/* the CSS_DYNAMIC_ states some selector asks of an element other
+ 	 * than its subject, as ".menu:hover .submenu" does (VitaSurf) */
+ 	uint32_t dynamic_ancestor;
++	/* where its :has() pseudo-classes are: css_stylesheet_has_shape
++	 * (VitaSurf) */
++	uint32_t has_shape;
+ 	/* and what those ancestors have to be, per state: see
+ 	 * css_stylesheet_dynamic_keys (VitaSurf) */
+ 	struct {

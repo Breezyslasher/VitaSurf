@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!--
+  A hidden last child shown by script inside a parent whose ::after is
+  a block of its own, a clearfix (VitaSurf). Its boxes are built on
+  their own and put before the ::after's: the log must not say "need
+  the layout rebuilt ... its parent has ::after content" for the first.
+  The second parent's ::after shows a counter, and the page is built
+  again. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Show before ::after</title>
+<style>
+.cf::after { content: ""; display: table; clear: both; }
+.cf .slot { display: none; height: 40px; }
+.cf .slot.on { display: block; }
+.fl { float: left; width: 50px; height: 10px; }
+.cnt { counter-reset: n; }
+.cnt > div { counter-increment: n; height: 20px; }
+.cnt > .off { display: none; }
+.cnt::after { content: "count " counter(n); display: block; height: 20px; }
+</style></head>
+<body>
+<div class="cf" id="p"><div class="fl">float</div><div id="a" style="height:20px">a</div><div class="slot" id="s">slot</div></div>
+<div id="below">below</div>
+<div class="cnt" id="c"><div>one</div><div class="off" id="o">two</div></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('show-before-after: ' + l); }
+function $(id) { return document.getElementById(id); }
+addEventListener('load', function () {
+  var h0 = $('p').offsetHeight, c0 = $('c').offsetHeight;
+  $('s').className = 'slot on';
+  setTimeout(function () {
+    ok('the slot is shown', $('s').offsetHeight, 40);
+    ok('after its sibling', $('s').offsetTop, $('a').offsetTop + 20);
+    ok('the parent grew by it', $('p').offsetHeight, h0 + 40);
+    ok('what is below moved down', $('below').offsetTop, $('p').offsetTop + h0 + 40);
+    $('o').className = '';
+    setTimeout(function () {
+      ok('a counted child is shown', $('o').offsetHeight, 20);
+      ok('its parent grew by it', $('c').offsetHeight, c0 + 20);
+      $('out').textContent = out.join('\n');
+      console.log('show-before-after: done');
+    }, 100);
+  }, 100);
+});
+</script>
+</body></html>
