@@ -66,12 +66,17 @@ struct vita_canvas {
 
 static unsigned int canvas_bytes;
 
+static void canvas_recip_init(void);
+
 /* An edge of the path being filled, in sub-scanline space. */
 struct canvas_edge {
 	double x;		/**< x where the edge meets sub-scanline y0 */
 	double dxdy;		/**< how x moves per sub-scanline */
 	int y0;			/**< first sub-scanline the edge covers */
 	int y1;			/**< one past the last */
+	int ys;			/**< first sub-scanline it is left of the
+				     canvas's right side; ys >= y0 */
+	int ye;			/**< one past its last such; ye <= y1 */
 	int dir;		/**< 1 downwards, -1 upwards, for nonzero */
 };
 
@@ -140,6 +145,7 @@ struct vita_canvas *vita_canvas_get(struct dom_node *node,
 	struct bitmap *old = NULL;
 	unsigned int bytes;
 
+	canvas_recip_init();
 	if (node == NULL || width <= 0 || height <= 0 ||
 	    width > CANVAS_SIDE_MAX || height > CANVAS_SIDE_MAX) {
 		return NULL;
@@ -242,12 +248,31 @@ static void canvas_channel_shifts(int *r, int *g, int *b, int *a)
  * \param rgba      the colour, 0xRRGGBBAA
  * \param coverage  0 to 255
  */
+/**
+ * floor(2^25 / d) + 1 for d of 1 to 255: n * it >> 25 is n / d exactly
+ * for every n up to 2 * 255 * 255, which a channel's sum is below.
+ */
+static uint32_t canvas_recip[256];
+
+static void canvas_recip_init(void)
+{
+	unsigned int d;
+
+	if (canvas_recip[1] != 0) {
+		return;
+	}
+	for (d = 1; d < 256; d++) {
+		canvas_recip[d] = (uint32_t) ((1u << 25) / d + 1);
+	}
+}
+
 static inline void canvas_blend(unsigned char *px, uint32_t rgba,
 				unsigned int coverage,
 				int ro, int go, int bo, int ao)
 {
 	unsigned int sa = ((rgba & 0xff) * coverage) / 255;
 	unsigned int da, out_a;
+	uint32_t recip;
 	unsigned int sr, sg, sb;
 
 	if (sa == 0) {
@@ -267,18 +292,30 @@ static inline void canvas_blend(unsigned char *px, uint32_t rgba,
 	}
 
 	da = px[ao];
+	if (da == 0) {
+		/* over nothing the colour is the source's own */
+		px[ro] = (unsigned char) sr;
+		px[go] = (unsigned char) sg;
+		px[bo] = (unsigned char) sb;
+		px[ao] = (unsigned char) sa;
+		return;
+	}
 	out_a = sa + (da * (255 - sa)) / 255;
 	if (out_a == 0) {
 		px[ro] = px[go] = px[bo] = px[ao] = 0;
 		return;
 	}
 
-	px[ro] = (unsigned char) ((sr * sa + px[ro] * da * (255 - sa) / 255) /
-			out_a);
-	px[go] = (unsigned char) ((sg * sa + px[go] * da * (255 - sa) / 255) /
-			out_a);
-	px[bo] = (unsigned char) ((sb * sa + px[bo] * da * (255 - sa) / 255) /
-			out_a);
+	/* each channel over out_a, by its reciprocal: the Cortex-A9 has no
+	   divide instruction, and three divisions a pixel in software were
+	   most of a translucent stroke's time */
+	recip = canvas_recip[out_a];
+	px[ro] = (unsigned char) (((uint64_t) (sr * sa +
+			px[ro] * da * (255 - sa) / 255) * recip) >> 25);
+	px[go] = (unsigned char) (((uint64_t) (sg * sa +
+			px[go] * da * (255 - sa) / 255) * recip) >> 25);
+	px[bo] = (unsigned char) (((uint64_t) (sb * sa +
+			px[bo] * da * (255 - sa) / 255) * recip) >> 25);
 	px[ao] = (unsigned char) out_a;
 }
 
@@ -474,7 +511,7 @@ void vita_canvas_clear_rect(struct vita_canvas *c,
  * Add one edge of the path, in sub-scanlines.
  */
 static bool canvas_add_edge(struct canvas_edges *edges, double x0, double y0,
-			    double x1, double y1, int height)
+			    double x1, double y1, int width, int height)
 {
 	struct canvas_edge *e;
 	int dir = 1;
@@ -498,6 +535,11 @@ static bool canvas_add_edge(struct canvas_edges *edges, double x0, double y0,
 	if (top >= bottom) {
 		return true;
 	}
+	/* past the right side an edge changes no pixel: what lies right of
+	   it is off the canvas */
+	if (x0 >= width && x1 >= width) {
+		return true;
+	}
 
 	if (edges->count == edges->allocated) {
 		unsigned int want = edges->allocated == 0 ?
@@ -517,34 +559,62 @@ static bool canvas_add_edge(struct canvas_edges *edges, double x0, double y0,
 	e->x = x0 + ((top + 0.5) / CANVAS_SUBS - y0) * (x1 - x0) / (y1 - y0);
 	e->y0 = top;
 	e->y1 = bottom;
+	e->ys = top;
+	e->ye = bottom;
 	e->dir = dir;
+	if (x0 >= width || x1 >= width) {
+		/* only the sub-scanlines where it is left of the right side
+		   need it, a sub-scanline more each way for rounding: the
+		   fill looks at each crossing in any case */
+		double at = top + (width - e->x) / e->dxdy;
+		int cut;
+
+		if (at < top - 2) at = top - 2;
+		if (at > bottom + 2) at = bottom + 2;
+		cut = (int) floor(at);
+
+		if (e->dxdy > 0) {
+			if (cut + 2 < e->ye) e->ye = cut + 2;
+		} else if (cut - 1 > e->ys) {
+			e->ys = cut - 1;
+		}
+		if (e->ys >= e->ye) {
+			edges->count--;
+		}
+	}
 
 	return true;
 }
 
 
-static int canvas_cross_cmp(const void *a, const void *b)
+static int canvas_edge_cmp(const void *a, const void *b)
 {
-	const struct canvas_cross *ca = a;
-	const struct canvas_cross *cb = b;
+	const struct canvas_edge *ea = a;
+	const struct canvas_edge *eb = b;
 
-	if (ca->x < cb->x) return -1;
-	if (ca->x > cb->x) return 1;
-
-	return 0;
+	return (ea->ys > eb->ys) - (ea->ys < eb->ys);
 }
 
 
 /**
  * Fill the edges gathered so far, and let them go.
+ *
+ * The edges are sorted by their first sub-scanline once, and each
+ * sub-scanline looks only at the edges that cross it, kept in the order
+ * of their crossings, which the next sub-scanline changes little: every
+ * edge had been tried at every sub-scanline and the crossings sorted
+ * afresh, and a page that strokes a path it keeps adding to (a canvas
+ * fingerprint draws a fan of lines so, a stroke after each) spent
+ * seconds there.
  */
 static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 			      const struct vita_canvas_paint *paint,
 			      bool evenodd)
 {
 	struct canvas_cross *crossings = NULL;
+	const struct canvas_edge **active = NULL, **beyond = NULL;
 	unsigned int *coverage = NULL;
-	unsigned int i;
+	unsigned int i, next = 0, n_active = 0;
 	int ro = 0, go = 1, bo = 2, ao = 3;
 	int y, sub, row;
 	int ytop = c->height * CANVAS_SUBS, ybottom = 0;
@@ -554,17 +624,22 @@ static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 	}
 
 	crossings = malloc(edges->count * sizeof(*crossings));
+	active = malloc(edges->count * sizeof(*active));
+	beyond = malloc(edges->count * sizeof(*beyond));
 	coverage = calloc((size_t) c->width, sizeof(*coverage));
-	if (crossings == NULL || coverage == NULL) {
+	if (crossings == NULL || active == NULL || beyond == NULL ||
+			coverage == NULL) {
 		goto out;
 	}
 
 	canvas_channel_shifts(&ro, &go, &bo, &ao);
 
+	qsort(edges->data, edges->count, sizeof(*edges->data),
+	      canvas_edge_cmp);
 	for (i = 0; i < edges->count; i++) {
-		if (edges->data[i].y0 < ytop) ytop = edges->data[i].y0;
-		if (edges->data[i].y1 > ybottom) ybottom = edges->data[i].y1;
+		if (edges->data[i].ye > ybottom) ybottom = edges->data[i].ye;
 	}
+	ytop = edges->data[0].ys;
 	if (ytop < 0) ytop = 0;
 	if (ybottom > c->height * CANVAS_SUBS) {
 		ybottom = c->height * CANVAS_SUBS;
@@ -572,37 +647,67 @@ static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 
 	for (row = ytop / CANVAS_SUBS; row <= (ybottom - 1) / CANVAS_SUBS &&
 			row < c->height; row++) {
-		bool any = false;
-
-		memset(coverage, 0, (size_t) c->width * sizeof(*coverage));
+		int lo = c->width, hi = 0;
 
 		for (sub = 0; sub < CANVAS_SUBS; sub++) {
-			unsigned int n = 0;
+			unsigned int n = 0, k, kept, n_beyond = 0;
 			int winding = 0;
-			unsigned int k;
 
 			y = row * CANVAS_SUBS + sub;
 			if (y < ytop || y >= ybottom) {
 				continue;
 			}
 
-			for (i = 0; i < edges->count; i++) {
-				const struct canvas_edge *e = &edges->data[i];
+			/* the edges this sub-scanline is past leave, and the
+			 * ones it reaches join at the end */
+			for (k = 0, kept = 0; k < n_active; k++) {
+				if (y < active[k]->ye) {
+					active[kept++] = active[k];
+				}
+			}
+			n_active = kept;
+			while (next < edges->count &&
+			       edges->data[next].ys <= y) {
+				if (y < edges->data[next].ye) {
+					active[n_active++] =
+						&edges->data[next];
+				}
+				next++;
+			}
 
-				if (y < e->y0 || y >= e->y1) {
+			/* their crossings, sorted by insertion: the order
+			 * is mostly last sub-scanline's, and the active
+			 * list takes it for the next. A crossing past the
+			 * right side bounds no pixel, so it is left out and
+			 * what is inside at the last one runs to the side */
+			for (k = 0; k < n_active; k++) {
+				const struct canvas_edge *e = active[k];
+				double x = e->x + e->dxdy * (y - e->y0);
+				unsigned int j = n;
+
+				if (x >= c->width) {
+					beyond[n_beyond++] = e;
 					continue;
 				}
-				crossings[n].x = e->x + e->dxdy * (y - e->y0);
-				crossings[n].dir = e->dir;
+
+				while (j > 0 && crossings[j - 1].x > x) {
+					crossings[j] = crossings[j - 1];
+					active[j] = active[j - 1];
+					j--;
+				}
+				crossings[j].x = x;
+				crossings[j].dir = e->dir;
+				active[j] = e;
 				n++;
 			}
-			if (n < 2) {
+			for (k = 0; k < n_beyond; k++) {
+				active[n + k] = beyond[k];
+			}
+			if (n == 0) {
 				continue;
 			}
-			qsort(crossings, n, sizeof(*crossings),
-			      canvas_cross_cmp);
 
-			for (k = 0; k + 1 <= n - 1; k++) {
+			for (k = 0; k < n; k++) {
 				bool inside;
 				double xa, xb;
 				int px, from, to;
@@ -615,15 +720,18 @@ static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 				}
 
 				xa = crossings[k].x;
-				xb = crossings[k + 1].x;
+				xb = k + 1 < n ? crossings[k + 1].x : c->width;
 				if (xb <= 0 || xa >= c->width || xb <= xa) {
 					continue;
 				}
 				if (xa < 0) xa = 0;
 				if (xb > c->width) xb = c->width;
 
-				from = (int) floor(xa);
-				to = (int) ceil(xb);
+				/* floor and ceil of what is now within
+				 * 0..width, without the library calls */
+				from = (int) xa;
+				to = (int) xb;
+				if (to < xb) to++;
 				if (to > c->width) to = c->width;
 
 				for (px = from; px < to; px++) {
@@ -640,21 +748,21 @@ static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 					 * leaves a solid fill at 252 */
 					coverage[px] += (unsigned int)
 						(part * 65535.0 / CANVAS_SUBS);
-					any = true;
+					if (px < lo) lo = px;
+					if (px >= hi) hi = px + 1;
 				}
 			}
 		}
 
-		if (any == false) {
-			continue;
-		}
-
-		for (i = 0; i < (unsigned int) c->width; i++) {
+		/* only the pixels this row covered are laid down and
+		 * cleared for the next */
+		for (i = (unsigned int) lo; i < (unsigned int) hi; i++) {
 			unsigned int cov = coverage[i];
 
 			if (cov == 0) {
 				continue;
 			}
+			coverage[i] = 0;
 			cov = (cov * 255 + 32767) / 65535;
 			if (cov > 255) {
 				cov = 255;
@@ -672,6 +780,8 @@ static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 
 out:
 	free(crossings);
+	free(active);
+	free(beyond);
 	free(coverage);
 	free(edges->data);
 	edges->data = NULL;
@@ -702,7 +812,7 @@ void vita_canvas_fill_path(struct vita_canvas *c, const double *pts,
 					pts[(at + i) * 2 + 1],
 					pts[(at + i + 1) * 2],
 					pts[(at + i + 1) * 2 + 1],
-					c->height) == false) {
+					c->width, c->height) == false) {
 				goto done;
 			}
 		}
@@ -714,7 +824,7 @@ void vita_canvas_fill_path(struct vita_canvas *c, const double *pts,
 					pts[(at + n - 1) * 2 + 1],
 					pts[at * 2],
 					pts[at * 2 + 1],
-					c->height) == false) {
+					c->width, c->height) == false) {
 				goto done;
 			}
 		}
@@ -731,7 +841,7 @@ done:
  */
 static bool canvas_stroke_segment(struct canvas_edges *edges, double x0,
 				  double y0, double x1, double y1,
-				  double half, int height)
+				  double half, int width, int height)
 {
 	double dx = x1 - x0, dy = y1 - y0;
 	double len = sqrt(dx * dx + dy * dy);
@@ -755,7 +865,7 @@ static bool canvas_stroke_segment(struct canvas_edges *edges, double x0,
 		int j = (i + 1) & 3;
 
 		if (canvas_add_edge(edges, qx[i], qy[i], qx[j], qy[j],
-				height) == false) {
+				width, height) == false) {
 			return false;
 		}
 	}
@@ -768,7 +878,7 @@ static bool canvas_stroke_segment(struct canvas_edges *edges, double x0,
  * Add a square at a joint, so a corner is not left with a notch in it.
  */
 static bool canvas_stroke_joint(struct canvas_edges *edges, double x,
-				double y, double half, int height)
+				double y, double half, int width, int height)
 {
 	double qx[4], qy[4];
 	int i;
@@ -786,7 +896,7 @@ static bool canvas_stroke_joint(struct canvas_edges *edges, double x,
 		int j = (i + 1) & 3;
 
 		if (canvas_add_edge(edges, qx[i], qy[i], qx[j], qy[j],
-				height) == false) {
+				width, height) == false) {
 			return false;
 		}
 	}
@@ -823,14 +933,14 @@ void vita_canvas_stroke_path(struct vita_canvas *c, const double *pts,
 					pts[(at + i) * 2 + 1],
 					pts[(at + i + 1) * 2],
 					pts[(at + i + 1) * 2 + 1],
-					half, c->height) == false) {
+					half, c->width, c->height) == false) {
 				goto done;
 			}
 			if (i > 0 && half > 0.7) {
 				if (canvas_stroke_joint(&edges,
 						pts[(at + i) * 2],
 						pts[(at + i) * 2 + 1],
-						half, c->height) == false) {
+						half, c->width, c->height) == false) {
 					goto done;
 				}
 			}

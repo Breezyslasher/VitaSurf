@@ -8168,8 +8168,14 @@ function CanvasRenderingContext2D(canvas){
  this.shadowBlur=0;this.shadowColor='rgba(0, 0, 0, 0)';this.shadowOffsetX=0;this.shadowOffsetY=0;
  this.__m=[1,0,0,1,0,0];      /* the current transform */
  this.__stack=[];             /* what save() put by */
- this.__subs=[];              /* the path, subpath by subpath */
- this.__cur=null;             /* the subpath being added to */
+ /* The path, in canvas pixels: every point's x and y one after the
+    other, and how many points each subpath has. It grows in place, as
+    a page that never begins a new path strokes all of it each time and
+    adds to it between: it had been an array a subpath, copied whole
+    into a new buffer at every fill and stroke. */
+ this.__pts=new Float64Array(32);this.__np=0;
+ this.__cnt=new Int32Array(8);this.__ns=0;
+ this.__cur=false;            /* whether the last subpath is open */
  this.__start=null;           /* where the current subpath began */
 }
 (function(){var C=CanvasRenderingContext2D.prototype;
@@ -8178,9 +8184,13 @@ function CanvasRenderingContext2D(canvas){
  /* roughly how much the transform scales lengths */
  function scaleOf(c){var m=c.__m;
   return Math.sqrt(Math.abs(m[0]*m[3]-m[1]*m[2]))||1;}
- function push(c,x,y){var p=tx(c,x,y);
-  if(c.__cur===null){c.__cur=[];c.__subs.push(c.__cur);}
-  c.__cur.push(p[0],p[1]);}
+ function push(c,x,y){var m=c.__m,a,n=c.__np;
+  if(!c.__cur){
+   if(c.__ns===c.__cnt.length){a=new Int32Array(c.__ns*2);a.set(c.__cnt);c.__cnt=a;}
+   c.__cnt[c.__ns++]=0;c.__cur=true;}
+  if(n+2>c.__pts.length){a=new Float64Array(c.__pts.length*2);a.set(c.__pts);c.__pts=a;}
+  c.__pts[n]=m[0]*x+m[2]*y+m[4];c.__pts[n+1]=m[1]*x+m[3]*y+m[5];
+  c.__np=n+2;c.__cnt[c.__ns-1]++;}
  C.save=function(){this.__stack.push({m:this.__m.slice(),fill:this.fillStyle,
   stroke:this.strokeStyle,lw:this.lineWidth,ga:this.globalAlpha,font:this.font,
   align:this.textAlign,base:this.textBaseline,cap:this.lineCap,join:this.lineJoin});
@@ -8202,15 +8212,13 @@ function CanvasRenderingContext2D(canvas){
  C.getTransform=function(){var m=this.__m;
   return {a:m[0],b:m[1],c:m[2],d:m[3],e:m[4],f:m[5],is2D:true,
    isIdentity:m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1&&m[4]===0&&m[5]===0};};
- C.beginPath=function(){this.__subs=[];this.__cur=null;this.__start=null;};
- C.moveTo=function(x,y){this.__cur=null;this.__start=[x,y];push(this,x,y);};
- C.lineTo=function(x,y){if(this.__cur===null&&this.__start===null)this.__start=[x,y];
+ C.beginPath=function(){this.__np=0;this.__ns=0;this.__cur=false;this.__start=null;};
+ C.moveTo=function(x,y){this.__cur=false;this.__start=[x,y];push(this,x,y);};
+ C.lineTo=function(x,y){if(!this.__cur&&this.__start===null)this.__start=[x,y];
   push(this,x,y);};
  C.closePath=function(){if(this.__cur&&this.__start)push(this,this.__start[0],this.__start[1]);
-  this.__cur=null;};
+  this.__cur=false;};
  C.bezierCurveTo=function(x1,y1,x2,y2,x,y){
-  var p=this.__cur?null:0,last=this.__cur&&this.__cur.length>=2?
-   this.__cur.slice(this.__cur.length-2):null;
   /* the start of the curve is where the path is now, in user space:
      it is easier to keep the user-space cursor than to invert */
   var sx=this.__ux==null?0:this.__ux, sy=this.__uy==null?0:this.__uy;
@@ -8244,19 +8252,10 @@ function CanvasRenderingContext2D(canvas){
   for(i=0;i<=n;i++){t=a0+span*i/n;cx=rx*Math.cos(t);cy=ry*Math.sin(t);
    push(this,x+cx*co-cy*si,y+cx*si+cy*co);}};
  C.arcTo=function(x1,y1,x2,y2,r){ this.lineTo(x1,y1); this.lineTo(x2,y2); };
- C.rect=function(x,y,w,h){this.__cur=null;this.__start=[x,y];
+ C.rect=function(x,y,w,h){this.__cur=false;this.__start=[x,y];
   push(this,x,y);push(this,x+w,y);push(this,x+w,y+h);push(this,x,y+h);
-  push(this,x,y);this.__cur=null;this.__ux=x;this.__uy=y;};
+  push(this,x,y);this.__cur=false;this.__ux=x;this.__uy=y;};
  C.roundRect=function(x,y,w,h,r){this.rect(x,y,w,h);};
- function flatten(c){
-  var subs=c.__subs,counts=[],total=0,i,j;
-  for(i=0;i<subs.length;i++){if(subs[i].length>=4){counts.push(subs[i].length/2);
-   total+=subs[i].length;}}
-  if(counts.length===0)return null;
-  var pts=new Float64Array(total),at=0;
-  for(i=0;i<subs.length;i++){if(subs[i].length<4)continue;
-   for(j=0;j<subs[i].length;j++)pts[at++]=subs[i][j];}
-  return {pts:pts,counts:counts};}
  /* What the rasteriser is asked to lay down: a colour, or a gradient
     flattened to [kind,x0,y0,r0,x1,y1,r1,angle, offset,colour, ...] with
     its geometry put through the current transform, because a gradient
@@ -8274,12 +8273,20 @@ function CanvasRenderingContext2D(canvas){
   for(i=0;i<style.__stops.length;i++){
    out.push(style.__stops[i][0],canvasColour(style.__stops[i][1],alpha));}
   return out;}
- function draw(c,mode){
+ function draw(c,mode,pts,cnt){
   if(!c.canvas||typeof NV.__vitaCanvasPath!=='function')return;
-  var f=flatten(c);if(!f)return;
+  if(!pts){if(c.__np<4)return;
+   pts=c.__pts.subarray(0,c.__np);cnt=c.__cnt.subarray(0,c.__ns);}
   var paint=paintOf(c,mode===2?c.strokeStyle:c.fillStyle,c.globalAlpha);
-  NV.__vitaCanvasPath(c.canvas,f.pts,f.counts,paint,mode,
+  NV.__vitaCanvasPath(c.canvas,pts,cnt,paint,mode,
    mode===2?Math.abs(c.lineWidth*scaleOf(c)):0);}
+ /* fillRect and strokeRect leave the path as it was */
+ var RECT=new Float64Array(10),RECTN=new Int32Array([5]);
+ function rectOf(c,x,y,w,h){var m=c.__m,i,px,py,
+   xs=[x,x+w,x+w,x,x],ys=[y,y,y+h,y+h,y];
+  for(i=0;i<5;i++){px=xs[i];py=ys[i];
+   RECT[2*i]=m[0]*px+m[2]*py+m[4];RECT[2*i+1]=m[1]*px+m[3]*py+m[5];}
+  return RECT;}
  C.fill=function(rule){draw(this,String(rule)==='evenodd'?1:0);};
  C.stroke=function(){draw(this,2);};
  C.clearRect=function(x,y,w,h){
@@ -8287,12 +8294,8 @@ function CanvasRenderingContext2D(canvas){
   var a=tx(this,x,y),b=tx(this,x+w,y+h);
   NV.__vitaCanvasClear(this.canvas,Math.min(a[0],b[0]),Math.min(a[1],b[1]),
    Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]));};
- C.fillRect=function(x,y,w,h){var keep=this.__subs,kc=this.__cur,ks=this.__start;
-  this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,0);
-  this.__subs=keep;this.__cur=kc;this.__start=ks;};
- C.strokeRect=function(x,y,w,h){var keep=this.__subs,kc=this.__cur,ks=this.__start;
-  this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,2);
-  this.__subs=keep;this.__cur=kc;this.__start=ks;};
+ C.fillRect=function(x,y,w,h){if(isFinite(x+y+w+h))draw(this,0,rectOf(this,x,y,w,h),RECTN);};
+ C.strokeRect=function(x,y,w,h){if(isFinite(x+y+w+h))draw(this,2,rectOf(this,x,y,w,h),RECTN);};
  C.reset=function(){this.__m=[1,0,0,1,0,0];this.beginPath();
   if(this.canvas&&typeof NV.__vitaCanvasClear==='function')
    NV.__vitaCanvasClear(this.canvas,0,0,this.canvas.width||300,this.canvas.height||150);};

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<!-- The context kept its path as an array a subpath and copied it into
+     a new buffer at every fill and stroke, and the rasteriser tried
+     every edge at every sub-scanline: a page that strokes a path it
+     keeps adding to, never beginning a new one, redrew all of it each
+     time. An analytics script's canvas fingerprint on cnn.com does that,
+     a fan of lines with a stroke after each, and it took 8 s. The path
+     now grows in place and the rasteriser keeps the edges each
+     sub-scanline crosses. What it draws must not change: the stroke
+     still lays the whole path down again, fillRect leaves the path
+     alone, and a path of more than 4096 subpaths is drawn (it had been
+     dropped). The "checksum" line is for comparing builds.
+     Expected: PASS lines. -->
+<html><head><style>body { margin: 0; background: #fff }</style></head><body>
+<canvas id="c" width="300" height="150"></canvas>
+<canvas id="d" width="200" height="150"></canvas>
+<canvas id="e" width="200" height="50"></canvas>
+<script>
+function px(x, a, b) { return x.getImageData(a, b, 1, 1).data; }
+function say(ok, what) { console.log((ok ? 'PASS' : 'FAIL') + ' ' + what); }
+var c = document.getElementById('c'), x = c.getContext('2d');
+
+/* the fan, as the fingerprint draws it: every stroke lays all the
+   lines so far down again, so the first is the darkest */
+var t0 = Date.now();
+for (var n = 0; n < c.width / 2; n++) {
+ x.moveTo(2 * n, 0); x.lineTo(4 * n, c.height);
+ x.strokeStyle = 'rgba(0, 0, 0, 0.1)'; x.stroke();
+}
+var ms = Date.now() - t0;
+var first = px(x, 3, 75)[3], late = px(x, 291, 0)[3];
+say(first > 200 && late > 0 && late < first,
+ 'a stroke lays the whole path down again (alpha ' + first + ' then ' + late + ')');
+
+/* one line stroked ten times in a translucent colour: 1 - 0.9^10 */
+var d = document.getElementById('d'), y = d.getContext('2d');
+y.beginPath(); y.moveTo(0, 5.5); y.lineTo(200, 5.5);
+y.strokeStyle = 'rgba(255, 0, 0, 0.1)';
+for (var i = 0; i < 10; i++) y.stroke();
+var a = px(y, 100, 5)[3];
+say(a >= 160 && a <= 172, 'ten strokes of one path compose (alpha ' + a + ', 166 expected)');
+
+/* fillRect between two lineTo calls leaves the path as it was */
+y.beginPath(); y.moveTo(20.5, 20); y.lineTo(20.5, 40);
+y.fillStyle = '#00f'; y.fillRect(100, 100, 10, 10);
+y.lineTo(60, 40.5); y.strokeStyle = '#000'; y.lineWidth = 1; y.stroke();
+var mid = px(y, 20, 30), cor = px(y, 50, 40), rect = px(y, 105, 105);
+say(mid[3] > 200 && cor[3] > 100 && rect[2] === 255 && rect[3] === 255,
+ 'fillRect leaves the path alone');
+y.fillRect(NaN, 0, 10, 10); y.fillRect(0, 0, Infinity, 10);
+say(px(y, 2, 150)[3] === 0, 'fillRect with a non-finite argument draws nothing');
+
+/* a path of 5000 subpaths is filled, the last of them too */
+var z = document.getElementById('e').getContext('2d');
+z.beginPath();
+for (i = 0; i < 5000; i++) z.rect(i % 100 * 2, Math.floor(i / 100), 1, 1);
+z.fillStyle = '#0a0'; z.fill();
+var last = px(z, 198, 49);
+say(last[1] === 170 && last[3] === 255, 'a path of 5000 subpaths is filled');
+
+/* an even-odd fill, a gradient and an arc, to compare builds by */
+y.beginPath(); y.arc(150, 60, 40, 0, Math.PI * 2); y.arc(150, 60, 20, 0, Math.PI * 2);
+var g = y.createLinearGradient(110, 0, 190, 0);
+g.addColorStop(0, '#f80'); g.addColorStop(1, '#08f');
+y.fillStyle = g; y.fill('evenodd');
+say(px(y, 150, 60)[3] === 0 && px(y, 150, 30)[3] === 255, 'an even-odd fill leaves the hole');
+y.lineWidth = 3; y.beginPath(); y.moveTo(10, 60); y.bezierCurveTo(40, 0, 70, 120, 100, 60);
+y.strokeStyle = 'rgba(0,0,0,0.6)'; y.stroke();
+
+var sum = 0, all = [x.getImageData(0, 0, 300, 150).data, y.getImageData(0, 0, 200, 150).data];
+for (var k = 0; k < 2; k++) for (i = 0; i < all[k].length; i++) sum = (sum * 31 + all[k][i]) >>> 0;
+console.log('checksum ' + sum + ', the fan in ' + ms + ' ms');
+</script></body></html>

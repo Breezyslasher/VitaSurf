@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!-- A canvas fingerprint as an analytics script on cnn.com draws it:
+     lines added to one path, never begun again, with a stroke after
+     each, so every stroke lays all the lines so far down again. On the
+     Vita it was 8 s of cnn.com's load. ?w= sets the canvas width (the
+     number of lines is half of it). -->
+<html><body><canvas id="c"></canvas><script>
+var w = +(/[?&]w=(\d+)/.exec(location.search) || [0, 300])[1];
+var c = document.getElementById('c'); c.width = w; c.height = 150;
+var t = c.getContext('2d'), t0 = Date.now();
+for (var n = 0; n < c.width / 2; n++) {
+ t.moveTo(2 * n, 0); t.lineTo(4 * n, c.height);
+ t.strokeStyle = 'rgba(0, 0, 0, 0.1)'; t.stroke();
+}
+console.log('canvas-strokes: ' + (c.width / 2) + ' strokes in ' + (Date.now() - t0) + ' ms');
+</script></body></html>

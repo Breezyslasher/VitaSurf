@@ -18439,7 +18439,7 @@ static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 	struct vita_canvas_paint paint;
 	struct vita_canvas_stop *stops = NULL;
 	double *points;
-	int *counts = NULL;
+	int *counts = NULL, *owned = NULL;
 	int32_t mode = 0;
 	double line_width = 1;
 	int n_points = 0;
@@ -18470,35 +18470,64 @@ static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 		JS_ToFloat64(ctx, &line_width, argv[5]);
 	}
 
-	{
+	if (JS_GetTypedArrayType(argv[2]) == JS_TYPED_ARRAY_INT32) {
+		/* the context keeps its counts in an Int32Array, read in
+		   place */
+		size_t byte_offset = 0, byte_length = 0, bytes_per = 0;
+		size_t size = 0;
+		JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[2],
+				&byte_offset, &byte_length, &bytes_per);
+		uint8_t *bytes;
+
+		if (JS_IsException(buffer)) {
+			free(stops);
+			return JS_EXCEPTION;
+		}
+		bytes = JS_GetArrayBuffer(ctx, &size, buffer);
+		JS_FreeValue(ctx, buffer);
+		if (bytes == NULL || bytes_per != sizeof(int32_t)) {
+			free(stops);
+			return JS_UNDEFINED;
+		}
+		counts = (int *) (void *) (bytes + byte_offset);
+		n_sub = (uint32_t) (byte_length / sizeof(int32_t));
+	} else {
 		JSValue len = JS_GetPropertyStr(ctx, argv[2], "length");
 
 		if (JS_ToUint32(ctx, &n_sub, len) != 0) {
 			n_sub = 0;
 		}
 		JS_FreeValue(ctx, len);
-	}
-	if (n_sub == 0 || n_sub > 4096) {
-		free(stops);
-		return JS_UNDEFINED;
-	}
+		if (n_sub == 0 || n_sub > (uint32_t) n_points) {
+			free(stops);
+			return JS_UNDEFINED;
+		}
+		counts = owned = malloc(n_sub * sizeof(*counts));
+		if (counts == NULL) {
+			free(stops);
+			return JS_UNDEFINED;
+		}
+		for (i = 0; i < n_sub; i++) {
+			JSValue item = JS_GetPropertyUint32(ctx, argv[2], i);
+			int32_t count = 0;
 
-	counts = malloc(n_sub * sizeof(*counts));
-	if (counts == NULL) {
-		free(stops);
-		return JS_UNDEFINED;
+			JS_ToInt32(ctx, &count, item);
+			JS_FreeValue(ctx, item);
+			counts[i] = count;
+		}
 	}
 	for (i = 0; i < n_sub; i++) {
-		JSValue item = JS_GetPropertyUint32(ctx, argv[2], i);
-		int32_t count = 0;
-
-		JS_ToInt32(ctx, &count, item);
-		JS_FreeValue(ctx, item);
-		counts[i] = count;
-		total += count;
+		if (counts[i] < 0 || counts[i] > n_points) {
+			total = -1;
+			break;
+		}
+		total += counts[i];
+		if (total * 2 > n_points) {
+			break;
+		}
 	}
-	if (total * 2 > n_points) {
-		free(counts);
+	if (n_sub == 0 || total < 0 || total * 2 > n_points) {
+		free(owned);
 		free(stops);
 		return JS_UNDEFINED;
 	}
@@ -18511,7 +18540,7 @@ static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 				      &paint, mode == 1);
 	}
 	vita_canvas_finish(canvas);
-	free(counts);
+	free(owned);
 	free(stops);
 
 	return JS_UNDEFINED;
