@@ -1,0 +1,77 @@
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index db5b17d67..9747434f5 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -207,6 +207,17 @@ static int html_object_reformat_wait(void)
+ }
+ 
+ 
++/* exported interface, documented in html/object.h */
++void html_object_schedule_reformat(html_content *c)
++{
++	if (c->object_reformat_pending) {
++		return;
++	}
++	c->object_reformat_pending = true;
++	guit->misc->schedule(html_object_reformat_wait(),
++			html_object_reformat, c);
++}
++
+ /**
+  * Callback for hlcache_handle_retrieve() for objects with no box.
+  */
+diff --git a/content/handlers/html/object.h b/content/handlers/html/object.h
+index ab726a201..c4b49ffe1 100644
+--- a/content/handlers/html/object.h
++++ b/content/handlers/html/object.h
+@@ -87,6 +87,14 @@ bool html_fetch_mask(struct html_content *c, struct nsurl *url, struct box *box)
+ bool html_fetch_border_image(struct html_content *c, struct nsurl *url,
+ 		struct box *box);
+ 
++/**
++ * Lay the page out again for something that changes the size of what is
++ * already laid out, a web font arriving, with the objects arriving
++ * meanwhile (VitaSurf): one pass for a burst of them, as soon as the
++ * last pass's cost allows.
++ */
++void html_object_schedule_reformat(struct html_content *c);
++
+ /**
+  * release memory of content objects associated with a HTML content
+  *
+diff --git a/content/handlers/html/webfont.c b/content/handlers/html/webfont.c
+index dac058e94..75d844887 100644
+--- a/content/handlers/html/webfont.c
++++ b/content/handlers/html/webfont.c
+@@ -53,6 +53,7 @@
+ #include "desktop/gui_internal.h"
+ 
+ #include "html/private.h"
++#include "html/object.h"
+ #include "html/webfont.h"
+ 
+ /** The most bytes held across every face. A face is held while a page
+@@ -306,6 +307,12 @@ static int webfont_src_rank(const css_font_face_src *src, const char *url)
+ 	return 1;
+ }
+ 
++/*
++ * A face that has arrived lays each page using it out again, with the
++ * faces and objects that arrive meanwhile (VitaSurf): each had laid the
++ * page out at once, and Spotify's eleven faces, which came in one fetch
++ * poll, were eleven passes of 280 ms back to back in build 787's log.
++ */
+ static void webfont_reformat(struct webfont *wf)
+ {
+ 	unsigned i;
+@@ -316,9 +323,7 @@ static void webfont_reformat(struct webfont *wf)
+ 		if (html->base.status != CONTENT_STATUS_READY &&
+ 				html->base.status != CONTENT_STATUS_DONE)
+ 			continue;
+-		content__reformat(&html->base, false,
+-				html->base.available_width,
+-				html->base.available_height);
++		html_object_schedule_reformat(html);
+ 	}
+ }
+ 
