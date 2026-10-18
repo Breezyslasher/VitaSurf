@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<!--
+  A change that a :has() left of a combinator asks about restyles in
+  place what that :has() can reach (html_restyle_has_outer, VitaSurf):
+  the subtree of the highest ancestor a selector's :has() was tried on,
+  and its later siblings'. The whole page had been built again, 2.4 s
+  each time on cnn.com, which has 499 such selectors. libcss tells
+  NetSurf where a :has() was tried (note_has), apart from the sibling
+  and position tests that mark an element whose children they read. The
+  log must not say "need the layout rebuilt" for the first four steps;
+  the last, a class on the root and a :has() there, still builds the
+  page again. Each line must say
+  PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>:has() left of a combinator</title>
+<style>
+.card .label { width: 100px; }
+.card:has(.flag) .label { width: 200px; }
+.link { width: 100px; }
+.link:has(> .show) + .link .t { width: 250px; }
+.link .t { width: 100px; }
+.x { width: 100px; }
+.box:has(.on) ~ .x { width: 150px; }
+html.late:has(.rootflag) .r { width: 300px; }
+.r { width: 100px; }
+div { height: 10px; }
+</style></head>
+<body>
+<div class="card"><div class="a"><span id="s1">x</span></div><div class="label" id="l1"></div></div>
+<div class="wrap"><div class="link" id="k1"><b id="b1">a</b></div><div class="link"><div class="t" id="t1"></div></div></div>
+<div class="sibs"><div class="box"><i id="i1">i</i></div><div class="x" id="x1"></div></div>
+<div class="r" id="r1"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('has-outer-restyle: ' + l); }
+function $(id) { return document.getElementById(id); }
+var steps = [
+  function () { $('s1').className = 'flag'; },
+  function () {
+    ok('a descendant after :has() takes the change', $('l1').offsetWidth, 200);
+    $('b1').className = 'show';
+  },
+  function () {
+    ok('"+" after :has(>) reaches the next one\'s child', $('t1').offsetWidth, 250);
+    $('i1').className = 'on';
+  },
+  function () {
+    ok('"~" after :has() reaches a later sibling', $('x1').offsetWidth, 150);
+    $('s1').className = '';
+  },
+  function () {
+    ok('and goes back when :has() stops matching', $('l1').offsetWidth, 100);
+    document.documentElement.className = 'late';
+    $('i1').className = 'rootflag';
+  },
+  function () {
+    ok('a :has() on the root still applies', $('r1').offsetWidth, 300);
+    $('out').textContent = out.join('\n');
+    console.log('has-outer-restyle: done');
+  }
+];
+addEventListener('load', function () {
+  var i = 0;
+  (function next() {
+    steps[i++]();
+    if (i < steps.length)
+      setTimeout(next, 150);
+  })();
+});
+</script>
+</body></html>

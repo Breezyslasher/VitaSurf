@@ -1,0 +1,56 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index b65be78..13aed5b 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -282,6 +282,16 @@ typedef struct css_select_handler {
+ 	 * sibling shares only what it would have been given.
+ 	 */
+ 	void (*note_order)(void *pw, void *node, bool children);
++
++	/**
++	 * A :has() was tried on \a node (VitaSurf), so a change in what
++	 * it asks about may change the styles of the elements a combinator
++	 * after it reaches; with \a siblings true its argument looked at
++	 * \a node's later siblings too. A client that restyles in place
++	 * learns from it where such a :has() can be. NULL when the client
++	 * does not ask.
++	 */
++	void (*note_has)(void *pw, void *node, bool siblings);
+ } css_select_handler;
+ 
+ /** How many attribute names a node can name before every bucket is
+diff --git a/src/select/select.c b/src/select/select.c
+index 108b28b..2cd9bfd 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -161,6 +161,14 @@ static inline void note_order(const css_select_state *state, void *node,
+ 		state->handler->note_order(state->pw, node, children);
+ }
+ 
++/** Tell the client a :has() was tried on node. */
++static inline void note_has(const css_select_state *state, void *node,
++		bool siblings)
++{
++	if (state->handler->note_has != NULL && node != NULL)
++		state->handler->note_has(state->pw, node, siblings);
++}
++
+ /**
+  * CSS rule source
+  */
+@@ -5477,6 +5485,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 	if (h->first_child_node == NULL || h->next_sibling_node == NULL)
+ 		return CSS_OK;
+ 	note_order(state, node, true);
++	note_has(state, node, false);
+ 
+ 	for (; sub != NULL; sub = sub->combinator) {
+ 		void *n = NULL;
+@@ -5489,6 +5498,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 						CSS_NODE_FLAGS_TAINT_SIBLING;
+ 			}
+ 			note_order(state, node, false);
++			note_has(state, node, true);
+ 			error = h->next_sibling_node(state->pw, node, &n);
+ 			if (error != CSS_OK)
+ 				return error;

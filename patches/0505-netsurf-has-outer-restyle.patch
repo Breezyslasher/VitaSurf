@@ -1,0 +1,224 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index bf3ee64e4..25d209867 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -58,6 +58,7 @@ static css_error part_host(void *pw, void *node, lwc_string *const *names,
+ 		uint32_t n_names, void *prev, void **host);
+ static css_error node_tree_scope(void *pw, void *node, void **scope);
+ static void note_order(void *pw, void *node, bool children);
++static void note_has(void *pw, void *node, bool siblings);
+ static css_error sibling_node(void *pw, void *node, void **sibling);
+ static css_error first_child_node(void *pw, void *node, void **child);
+ static css_error next_sibling_node(void *pw, void *node, void **sibling);
+@@ -171,6 +172,7 @@ static css_select_handler selection_handler = {
+ 	part_host,
+ 	node_tree_scope,
+ 	note_order,
++	note_has,
+ };
+ 
+ /* The size of a node's container, for @container (VitaSurf) */
+@@ -1033,16 +1035,29 @@ static css_error node_tree_scope(void *pw, void *node, void **scope)
+ 	return CSS_OK;
+ }
+ 
+-/** Mark an element whose children's order or presence a selector reads. */
+-static void mark_children_ordered(dom_node *n)
++/* What the marks under __ns_key_children_ordered say (VitaSurf): a
++ * selector read the order or presence of the element's children, and a
++ * :has() was tried on it, which reads its children too. */
++#define MARK_ORDERED 1
++#define MARK_HAS 2
++
++/** Mark an element, adding to what it is marked with. */
++static void mark_element(dom_node *n, uintptr_t bits)
+ {
+ 	void *old = NULL;
+ 
+ 	if (dom_node_get_user_data(n, corestring_dom___ns_key_children_ordered,
+-			&old) == DOM_NO_ERR && old != NULL)
++			&old) == DOM_NO_ERR &&
++			((uintptr_t) old & bits) == bits)
+ 		return;
+ 	dom_node_set_user_data(n, corestring_dom___ns_key_children_ordered,
+-			(void *) 1, NULL, &old);
++			(void *) ((uintptr_t) old | bits), NULL, &old);
++}
++
++/** Mark an element whose children's order or presence a selector reads. */
++static void mark_children_ordered(dom_node *n)
++{
++	mark_element(n, MARK_ORDERED);
+ }
+ 
+ /*
+@@ -1070,6 +1085,37 @@ static void note_order(void *pw, void *node, bool children)
+ 	dom_node_unref(parent);
+ }
+ 
++/*
++ * A :has() was tried on a node (VitaSurf): it is marked, and its parent
++ * too when the argument looked at its later siblings, so that a change
++ * such a :has() asks about finds where it can be (nscss_has_subject).
++ */
++static void note_has(void *pw, void *node, bool siblings)
++{
++	dom_node *n = node, *parent = NULL;
++	dom_node_type type;
++
++	(void)pw;
++	mark_element(n, MARK_ORDERED | MARK_HAS);
++	if (!siblings || dom_node_get_parent_node(n, &parent) != DOM_NO_ERR ||
++			parent == NULL)
++		return;
++	if (dom_node_get_node_type(parent, &type) == DOM_NO_ERR &&
++			type == DOM_ELEMENT_NODE)
++		mark_element(parent, MARK_ORDERED | MARK_HAS);
++	dom_node_unref(parent);
++}
++
++/* exported function documented in css/select.h */
++bool nscss_has_subject(dom_node *n)
++{
++	void *mark = NULL;
++
++	return dom_node_get_user_data(n,
++			corestring_dom___ns_key_children_ordered, &mark) !=
++			DOM_NO_ERR || ((uintptr_t) mark & MARK_HAS) != 0;
++}
++
+ /* exported function documented in css/select.h */
+ bool nscss_children_ordered(dom_node *n)
+ {
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index f52f3ab90..c567238fc 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -87,6 +87,14 @@ void *nscss_tree_scope(dom_node *n);
+  */
+ bool nscss_children_ordered(dom_node *n);
+ 
++/**
++ * Whether a :has() has been tried on an element, or one with an argument
++ * that looks at siblings on one of its children (VitaSurf): a change a
++ * :has() left of a combinator asks about restyles from the highest such
++ * ancestor.
++ */
++bool nscss_has_subject(dom_node *n);
++
+ /**
+  * Take the selection data libcss cached on a node off it, without
+  * destroying it, so the node can be selected for again and the data put
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 261b32258..7571ff208 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -4814,6 +4814,69 @@ static enum box_restyle html_restyle_has(html_content *c, dom_node *n,
+ 	return result;
+ }
+ 
++/**
++ * Restyle what a :has() left of a combinator can answer differently for
++ * a change to an element (VitaSurf). libcss tells NetSurf each element a
++ * :has() was tried on (the parent too, for an argument that looks at
++ * siblings: note_has), so a :has() that could now answer otherwise is on
++ * a marked ancestor:
++ * the highest one, its subtree and the subtrees of its later siblings
++ * are selected again in place, which holds whatever a combinator after
++ * the :has() reaches. A :has() never tried on an element decides no
++ * style there. cnn.com's page, with 499 such selectors, had been built
++ * again for each change one of them asked about, 2.4 s each.
++ */
++static enum box_restyle html_restyle_has_outer(html_content *c, dom_node *n,
++		unsigned *budget)
++{
++	enum box_restyle result = BOX_RESTYLE_SAME, r;
++	dom_node *at, *next = NULL, *top = NULL;
++	dom_node_type type;
++
++	if (dom_node_get_parent_node(n, &at) != DOM_NO_ERR)
++		return BOX_RESTYLE_LAYOUT;
++	while (at != NULL) {
++		if (dom_node_get_node_type(at, &type) != DOM_NO_ERR ||
++				type != DOM_ELEMENT_NODE)
++			break;
++		if (nscss_has_subject(at)) {
++			if (top != NULL)
++				dom_node_unref(top);
++			top = dom_node_ref(at);
++		}
++		if (dom_node_get_parent_node(at, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(at);
++		at = next;
++	}
++	if (at != NULL)
++		dom_node_unref(at);
++	if (top == NULL)
++		return BOX_RESTYLE_SAME;
++
++	/* the root's subtree is the whole page, which is built again */
++	if (box_for_node(top) == c->layout) {
++		dom_node_unref(top);
++		return BOX_RESTYLE_LAYOUT;
++	}
++	at = top;
++	while (at != NULL && result != BOX_RESTYLE_LAYOUT) {
++		if (dom_node_get_node_type(at, &type) == DOM_NO_ERR &&
++				type == DOM_ELEMENT_NODE) {
++			r = box_restyle(c, at, true, budget);
++			if (r > result)
++				result = r;
++		}
++		if (dom_node_get_next_sibling(at, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(at);
++		at = next;
++	}
++	if (at != NULL)
++		dom_node_unref(at);
++	return result;
++}
++
+ /** Whether a class list holds a class, as whitespace separated words. */
+ static bool html_class_in(const char *list, size_t list_len,
+ 		const char *word, size_t len)
+@@ -5417,13 +5480,7 @@ bool html_restyle_attrs(html_content *c,
+ 		 * a :has() asked about, 2.5 to 2.7 s each time (VitaSurf). */
+ 		has = html_reach_hit(c, CSS_REACH_HAS, &rc);
+ 		shape = has ? html_reach_has_shape(c, &rc) : 0;
+-		if (has && (shape & CSS_HAS_SHAPE_OUTER) != 0) {
+-			ATTR_WHY("%s on <%s>, which a :has() left of a "
+-					"combinator asks about", name,
+-					tag != NULL ?
+-					dom_string_data(tag) : "?");
+-			res = BOX_RESTYLE_LAYOUT;
+-		} else {
++		{
+ 			subtree = html_reach_hit(c, CSS_REACH_DESCENDANTS, &rc);
+ 			deep = html_reach_hit(c, CSS_REACH_SIBLINGS_DEEP, &rc);
+ 			sibs = deep || html_reach_hit(c, CSS_REACH_SIBLINGS,
+@@ -5448,7 +5505,22 @@ bool html_restyle_attrs(html_content *c,
+ 				if (r != BOX_RESTYLE_SAME)
+ 					area_whole = true;
+ 			}
+-			if (res == BOX_RESTYLE_LAYOUT)
++			if (has && (shape & CSS_HAS_SHAPE_OUTER) != 0 &&
++					res != BOX_RESTYLE_LAYOUT) {
++				r = html_restyle_has_outer(c, ch->node,
++						&budget);
++				if (r > res)
++					res = r;
++				if (r == BOX_RESTYLE_LAYOUT && budget > 0)
++					ATTR_WHY("%s on <%s>, which a :has() "
++						"left of a combinator on the "
++						"root asks about", name,
++						tag != NULL ?
++						dom_string_data(tag) : "?");
++				if (r != BOX_RESTYLE_SAME)
++					area_whole = true;
++			}
++			if (res == BOX_RESTYLE_LAYOUT && why[0] == '\0')
+ 				ATTR_WHY("%s on <%s>: %s", name,
+ 						tag != NULL ?
+ 						dom_string_data(tag) : "?",
