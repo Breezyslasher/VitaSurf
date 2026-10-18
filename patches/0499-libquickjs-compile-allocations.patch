@@ -1,0 +1,181 @@
+diff --git a/cutils.h b/cutils.h
+index c45009e..bd98ea4 100644
+--- a/cutils.h
++++ b/cutils.h
+@@ -771,6 +771,11 @@ static inline int dbuf_claim(DynBuf *s, size_t len)
+         if (s->error)
+             return -1;
+         size = s->allocated_size + (s->allocated_size / 2);
++        /* at least 64 bytes (VitaSurf): a buffer that began empty grew
++           a byte or two at a time, a dozen reallocs to reach 140 bytes,
++           and the compiler keeps several for each function */
++        if (size < 64)
++            size = 64;
+         if (size < new_size || size < s->allocated_size) /* overflow test */
+             new_allocated_size = new_size;
+         else
+diff --git a/libunicode.c b/libunicode.c
+index 09a76a7..8b7e41f 100644
+--- a/libunicode.c
++++ b/libunicode.c
+@@ -1380,24 +1380,95 @@ static void cr_sort_and_remove_overlap(CharRange *cr)
+ 
+ /* canonicalize a character set using the JS regex case folding rules
+    (see lre_canonicalize()) */
++/*
++ * The characters case folding changes, and the rest, for each mode
++ * (VitaSurf): made once and kept, with the C allocator, for the life of
++ * the program. They had been made from the whole case table for every
++ * class of a regular expression with the i flag, some 110,000
++ * instructions each, as a page's scripts were compiled.
++ */
++static int cr_case_masks(bool is_unicode, const CharRange **pmask,
++                         const CharRange **pinv)
++{
++    static CharRange mask[2], inv[2];
++    static bool made[2];
++    int k = is_unicode;
++
++    if (!made[k]) {
++        cr_init(&mask[k], NULL, NULL);
++        cr_init(&inv[k], NULL, NULL);
++        if (unicode_case1(&mask[k], is_unicode ? CASE_F : CASE_U) ||
++            cr_copy(&inv[k], &mask[k]) || cr_invert(&inv[k])) {
++            cr_free(&mask[k]);
++            cr_free(&inv[k]);
++            return -1;
++        }
++        made[k] = true;
++    }
++    *pmask = &mask[k];
++    *pinv = &inv[k];
++    return 0;
++}
++
++/*
++ * cr = big & small, reading only the intervals of big that can meet
++ * small (VitaSurf): a class of a few ranges against the whole case
++ * table had walked all of the table.
++ */
++static int cr_inter_span(CharRange *cr, const CharRange *big,
++                         const CharRange *small)
++{
++    int lo, hi, a, b, m;
++    uint32_t first, last;
++
++    if (small->len == 0)
++        return cr_op(cr, big->points, 0, small->points, 0, CR_OP_INTER);
++    first = small->points[0];
++    last = small->points[small->len - 1];
++    /* lo: the first point of big above first, back to its interval's
++       start; hi: the first point of big at or above last, on to its
++       interval's end */
++    a = 0;
++    b = big->len;
++    while (a < b) {
++        m = (a + b) / 2;
++        if (big->points[m] <= first)
++            a = m + 1;
++        else
++            b = m;
++    }
++    lo = a & ~1;
++    a = lo;
++    b = big->len;
++    while (a < b) {
++        m = (a + b) / 2;
++        if (big->points[m] < last)
++            a = m + 1;
++        else
++            b = m;
++    }
++    hi = (a + 1) & ~1;
++    if (hi > big->len)
++        hi = big->len;
++    return cr_op(cr, big->points + lo, hi - lo, small->points, small->len,
++                 CR_OP_INTER);
++}
++
+ int cr_regexp_canonicalize(CharRange *cr, bool is_unicode)
+ {
+-    CharRange cr_inter, cr_mask, cr_result, cr_sub;
++    CharRange cr_inter, cr_result, cr_sub;
++    const CharRange *mask, *inv;
+     uint32_t v, code, len, i, idx, start, end, c, d_start, d_end, d;
+ 
+-    cr_init(&cr_mask, cr->mem_opaque, cr->realloc_func);
+     cr_init(&cr_inter, cr->mem_opaque, cr->realloc_func);
+     cr_init(&cr_result, cr->mem_opaque, cr->realloc_func);
+     cr_init(&cr_sub, cr->mem_opaque, cr->realloc_func);
+ 
+-    if (unicode_case1(&cr_mask, is_unicode ? CASE_F : CASE_U))
++    if (cr_case_masks(is_unicode, &mask, &inv))
+         goto fail;
+-    if (cr_op(&cr_inter, cr_mask.points, cr_mask.len, cr->points, cr->len, CR_OP_INTER))
+-        goto fail;
+-
+-    if (cr_invert(&cr_mask))
++    if (cr_inter_span(&cr_inter, mask, cr))
+         goto fail;
+-    if (cr_op(&cr_sub, cr_mask.points, cr_mask.len, cr->points, cr->len, CR_OP_INTER))
++    if (cr_inter_span(&cr_sub, inv, cr))
+         goto fail;
+ 
+     /* cr_inter = cr & cr_mask */
+@@ -1452,13 +1523,11 @@ int cr_regexp_canonicalize(CharRange *cr, bool is_unicode)
+         goto fail;
+ 
+     cr_free(&cr_inter);
+-    cr_free(&cr_mask);
+     cr_free(&cr_result);
+     cr_free(&cr_sub);
+     return 0;
+  fail:
+     cr_free(&cr_inter);
+-    cr_free(&cr_mask);
+     cr_free(&cr_result);
+     cr_free(&cr_sub);
+     return -1;
+diff --git a/quickjs.c b/quickjs.c
+index f60c0b0..409437b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1979,6 +1979,11 @@ static no_inline int js_realloc_array(JSContext *ctx, void **parray,
+     void *new_array;
+     /* XXX: potential arithmetic overflow */
+     new_size = max_int(req_size, *psize * 3 / 2);
++    /* at least 8 (VitaSurf): the compiler's arrays (a function's
++       variables, constants, labels, closure variables) began empty and
++       grew by one or two at a time */
++    if (new_size < 8)
++        new_size = 8;
+     new_array = js_realloc2(ctx, *parray, new_size * elem_size, &slack);
+     if (!new_array)
+         return -1;
+@@ -22982,6 +22987,26 @@ static __exception int js_parse_string(JSParseState *s, int sep,
+         *pp = p;
+         return 0;
+     }
++    if (sep != '`') {
++        /* nothing but printable ASCII to the quote, as most are
++           (VitaSurf): the string is the source's text, made at once
++           where it had gone through a buffer a character at a time */
++        const uint8_t *q = p;
++
++        while (q < s->buf_end && *q != sep && *q != '\\' &&
++               *q >= 0x20 && *q < 0x80)
++            q++;
++        if (q < s->buf_end && *q == sep) {
++            str = js_new_string8_len(s->ctx, (const char *)p, q - p);
++            if (JS_IsException(str))
++                return -1;
++            token->val = TOK_STRING;
++            token->u.str.sep = sep;
++            token->u.str.str = str;
++            *pp = q + 1;
++            return 0;
++        }
++    }
+     if (string_buffer_init(s->ctx, b, 32))
+         goto fail;
+     for(;;) {

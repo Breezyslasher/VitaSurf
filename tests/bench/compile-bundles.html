@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  Compile time (VitaSurf, patch 0499): a page's script compiles through
+  new Function() here, and the log's load line says how long its own
+  scripts took. Natively, six of CNN's bundles (3.3 MB) compiled in the
+  browser's lazy mode went from 918 to 760 million instructions, and
+  scripts/compile-corpus.sh's 50 largest files from 4256 ms to 3791 ms
+  with the bytecode unchanged: a buffer that began empty grew a byte at a
+  time, the compiler's arrays one element at a time, every class of a
+  regular expression with the i flag rebuilt the set of characters case
+  folding changes from the whole case table, and every string literal
+  went through a buffer a character at a time.
+-->
+<html><head><meta charset="utf-8"><title>compile bundles</title></head>
+<body><script>
+(function () {
+  var parts = [], i;
+  for (i = 0; i < 4000; i++)
+    parts.push('function f' + i + '(a,b){var s="item ' + i + ' of the list",r=/[a-z_]+/i;' +
+      'return a&&b?{k:s,v:[a,b,' + i + '],t:r.test(s)}:(a||{})}');
+  var src = parts.join('\n'), t0 = performance.now();
+  new Function(src);
+  console.log('compile-bundles: ' + (src.length >> 10) + ' KB compiled in ' +
+    (performance.now() - t0).toFixed(1) + ' ms');
+})();
+</script></body></html>

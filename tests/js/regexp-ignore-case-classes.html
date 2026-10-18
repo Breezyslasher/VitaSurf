@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Case-insensitive classes</title></head>
+<body><pre id="out"></pre>
+<script>
+/* A class in a regular expression with the i flag is folded with the set
+   of characters case folding changes, kept from one compile to the next,
+   and only the part of that set near the class is read (VitaSurf, patch
+   0499). Each class must match what it did: every character of the BMP,
+   and for iu some astral ones, are tried. Each line must say PASS; the
+   expected answers are Chrome's and Node's. */
+var R = [];
+var classes = ['[a-z]', '[A-Z]', '[k]', '[s]', '[^a-z]', '[0-9a-f]', '[\\u00e0-\\u00ff]', '[\\u0130]', '[\\u0131]', '[\\u017f]', '[\\u212a]', '[\\u1e9e]', '[\\u03c3]', '[\\u0390-\\u03ff]', '[\\u0400-\\u04ff]', '[\\u10a0-\\u10ff]', '[\\u1f00-\\u1fff]', '[\\u2c00-\\u2cff]', '[\\uff21-\\uff5a]', '[a-zA-Z0-9_]', '\\w', '[\\w-]', '[^\\w]', '[\\u00b5]', '[\\u01c4-\\u01cc]', '[x-\\u0100]', '[\\u0041-\\u005a\\u0100-\\u017f]', '[\\uabcd-\\uabff]', '[\\ua640-\\ua69f]', '[\\u0250-\\u02af]'];
+['i', 'iu'].forEach(function (f) {
+  classes.forEach(function (c) {
+    var re = new RegExp(c, f), n = 0, h = 0, cp;
+    for (cp = 0; cp < 0x10000; cp++) if (re.test(String.fromCharCode(cp))) { n++; h = (h * 31 + cp) | 0; }
+    if (f === 'iu') for (cp = 0x10400; cp < 0x10500; cp++) if (re.test(String.fromCodePoint(cp))) { n++; h = (h * 31 + cp) | 0; }
+    R.push('/' + c + '/' + f + ': ' + n + ' ' + h);
+  });
+});
+var WANT = [
+"/[a-z]/i: 52 -870340326",
+"/[A-Z]/i: 52 -870340326",
+"/[k]/i: 2 2432",
+"/[s]/i: 2 2688",
+"/[^a-z]/i: 65484 945704282",
+"/[0-9a-f]/i: 22 -1434225397",
+"/[\\u00e0-\\u00ff]/i: 63 1597073848",
+"/[\\u0130]/i: 1 304",
+"/[\\u0131]/i: 1 305",
+"/[\\u017f]/i: 1 383",
+"/[\\u212a]/i: 1 8490",
+"/[\\u1e9e]/i: 1 7838",
+"/[\\u03c3]/i: 3 925476",
+"/[\\u0390-\\u03ff]/i: 126 960153775",
+"/[\\u0400-\\u04ff]/i: 264 -1020733308",
+"/[\\u10a0-\\u10ff]/i: 182 -88071870",
+"/[\\u1f00-\\u1fff]/i: 259 -1681319483",
+"/[\\u2c00-\\u2cff]/i: 267 170458418",
+"/[\\uff21-\\uff5a]/i: 58 784433085",
+"/[a-zA-Z0-9_]/i: 63 -1864058214",
+"/\\w/i: 63 -1864058214",
+"/[\\w-]/i: 64 -940414771",
+"/[^\\w]/i: 65473 -1298306012",
+"/[\\u00b5]/i: 3 203541",
+"/[\\u01c4-\\u01cc]/i: 9 -1930229688",
+"/[x-\\u0100]/i: 144 193390810",
+"/[\\u0041-\\u005a\\u0100-\\u017f]/i: 181 -970609819",
+"/[\\uabcd-\\uabff]/i: 51 -868150682",
+"/[\\ua640-\\ua69f]/i: 97 706403512",
+"/[\\u0250-\\u02af]/i: 134 -776743069",
+"/[a-z]/iu: 54 1121589797",
+"/[A-Z]/iu: 54 1121589797",
+"/[k]/iu: 3 83882",
+"/[s]/iu: 3 83711",
+"/[^a-z]/iu: 65738 517291835",
+"/[0-9a-f]/iu: 22 -1434225397",
+"/[\\u00e0-\\u00ff]/iu: 64 -2030309773",
+"/[\\u0130]/iu: 1 304",
+"/[\\u0131]/iu: 1 305",
+"/[\\u017f]/iu: 3 83711",
+"/[\\u212a]/iu: 3 83882",
+"/[\\u1e9e]/iu: 2 14751",
+"/[\\u03c3]/iu: 3 925476",
+"/[\\u0390-\\u03ff]/iu: 129 -532989529",
+"/[\\u0400-\\u04ff]/iu: 264 -1020733308",
+"/[\\u10a0-\\u10ff]/iu: 182 -88071870",
+"/[\\u1f00-\\u1fff]/iu: 261 481133335",
+"/[\\u2c00-\\u2cff]/iu: 267 170458418",
+"/[\\uff21-\\uff5a]/iu: 58 784433085",
+"/[a-zA-Z0-9_]/iu: 65 -358560859",
+"/\\w/iu: 65 -358560859",
+"/[\\w-]/iu: 66 -1795442408",
+"/[^\\w]/iu: 65727 -1941682043",
+"/[\\u00b5]/iu: 3 203541",
+"/[\\u01c4-\\u01cc]/iu: 9 -1930229688",
+"/[x-\\u0100]/iu: 146 1165226151",
+"/[\\u0041-\\u005a\\u0100-\\u017f]/iu: 182 -24124827",
+"/[\\uabcd-\\uabff]/iu: 51 -868150682",
+"/[\\ua640-\\ua69f]/iu: 97 706403512",
+"/[\\u0250-\\u02af]/iu: 134 -776743069"
+];
+var o = document.getElementById('out');
+R.forEach(function (l, i) {
+  var line = (l === WANT[i] ? 'PASS ' : 'FAIL ') + l + (l === WANT[i] ? '' : ' (want ' + WANT[i] + ')');
+  o.textContent += line + '\n';
+  console.log('regexp-classes: ' + line);
+});
+console.log('regexp-classes: done');
+</script>
+</body></html>
