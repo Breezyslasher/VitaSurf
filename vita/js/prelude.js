@@ -9279,26 +9279,18 @@ function dataAttr(k){
  if(DATA_ATTR_N>=2000){DATA_ATTR=Object.create(null);DATA_ATTR_N=0;}
  DATA_ATTR[k]=a;DATA_ATTR_N++;
  return a;}
-function dataName(n){return n.slice(5).replace(/-([a-z])/g,function(_,c){return c.toUpperCase();});}
-function dataKeys(el){return attrList(el).filter(function(a){
- return a.name.indexOf('data-')===0;}).map(function(a){return dataName(a.name);});}
-Object.defineProperty(P,'dataset',{configurable:true,get:function(){
- var el=this;
- return priv(this,'__dataset',function(){
-  if(typeof Proxy!=='function'){
-   var o={};dataKeys(el).forEach(function(k){o[k]=el.getAttribute(dataAttr(k));});
-   return o;}
-  return new Proxy({},{
-   get:function(t,k){if(typeof k!=='string')return undefined;
-    var v=el.getAttribute(dataAttr(k));return v===null?undefined:v;},
-   set:function(t,k,v){el.setAttribute(dataAttr(k),String(v));return true;},
-   has:function(t,k){return typeof k==='string'&&el.hasAttribute(dataAttr(k));},
-   deleteProperty:function(t,k){el.removeAttribute(dataAttr(k));return true;},
-   ownKeys:function(){return dataKeys(el);},
-   getOwnPropertyDescriptor:function(t,k){
-    if(typeof k!=='string'||!el.hasAttribute(dataAttr(k)))return undefined;
-    return {configurable:true,enumerable:true,writable:true,
-     value:el.getAttribute(dataAttr(k))};}});});}});
+/* a DOMStringMap made in C (__vitaDatasetGet in qjs.c), which reads, tests
+   and lists the attributes itself and writes and removes them through
+   these, the prelude's own setAttribute and removeAttribute; the proxy
+   it replaced ran a trap in script for every read (VitaSurf) */
+var DS_SET=P.setAttribute,DS_REMOVE=P.removeAttribute;
+NV.__vitaDatasetWrite=function(el,k,v){
+ if(/-[a-z]/.test(k))throw new DOMException("Failed to set a named property '"+
+  k+"' on 'DOMStringMap': '"+k+"' is not a valid property name.",'SyntaxError');
+ DS_SET.call(el,dataAttr(k),String(v));};
+NV.__vitaDatasetRemove=function(el,k){DS_REMOVE.call(el,dataAttr(k));};
+Object.defineProperty(P,'dataset',{configurable:true,
+ get:NV.__vitaDatasetGet});
 /* tabIndex answered 0 for everything, so every element looked focusable
  * to code that tests it. Without the attribute it is 0 only for what the
  * specification makes focusable by default, and -1 otherwise. */

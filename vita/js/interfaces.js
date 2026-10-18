@@ -533,4 +533,6 @@ if(W.XMLDocument)define(W.XMLDocument,Symbol.hasInstance,{configurable:true,
 if(W.FileReaderSync)ORIG.FileReaderSync=W.FileReaderSync;
 try{delete W.FileReaderSync;}catch(e){}
 if(!W.crossOriginIsolated)try{delete W.SharedArrayBuffer;}catch(e){}
+/* the prototype every el.dataset is made with (prelude.js) */
+if(W.DOMStringMap)NV.__vitaDatasetProto=W.DOMStringMap.prototype;
 })();

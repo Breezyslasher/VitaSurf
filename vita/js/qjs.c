@@ -178,6 +178,7 @@ enum {
 struct js_wrapper {
 	struct dom_node *node;
 	JSValue obj;
+	JSValue dataset;	/**< its el.dataset once asked for, or undefined */
 	struct js_wrapper *next;
 };
 
@@ -2069,6 +2070,7 @@ static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 		if (w != NULL) {
 			w->node = node;
 			w->obj = JS_DupValue(ctx, obj);
+			w->dataset = JS_UNDEFINED;
 			w->next = thread->wrappers[h];
 			thread->wrappers[h] = w;
 		}
@@ -2085,6 +2087,7 @@ static void free_wrappers(jsthread *thread)
 		while (w != NULL) {
 			struct js_wrapper *next = w->next;
 			JS_FreeValue(thread->ctx, w->obj);
+			JS_FreeValue(thread->ctx, w->dataset);
 			free(w);
 			w = next;
 		}
@@ -8336,6 +8339,412 @@ static JSValue win_vita_html_dda(JSContext *ctx, JSValueConst this_val,
 	}
 	JS_SetIsHTMLDDA(ctx, argv[0]);
 	return JS_DupValue(ctx, argv[0]);
+}
+
+/*
+ * el.dataset, a DOMStringMap (VitaSurf): its named properties are the
+ * element's data-* attributes, as the HTML standard has them, answered
+ * here from libdom. It had been a Proxy whose traps ran in script, a
+ * call into the prelude and a getAttribute for every read, and
+ * Object.keys() walked the attributes in script and took a descriptor
+ * of each through another trap: cnn.com's analytics read every
+ * element's dataset so, 18% of its profile in build 787's log. Writes
+ * and deletes go through the prelude's own setAttribute and
+ * removeAttribute (__vitaDatasetWrite, __vitaDatasetRemove), which
+ * keep what attribute changes owe custom elements and observers.
+ */
+static JSClassID dataset_class_id;
+
+static void dataset_finalizer(JSRuntime *rt, JSValue val)
+{
+	JSValue *el = JS_GetOpaque(val, dataset_class_id);
+
+	if (el != NULL) {
+		JS_FreeValueRT(rt, *el);
+		js_free_rt(rt, el);
+	}
+}
+
+static void dataset_mark(JSRuntime *rt, JSValueConst val,
+			 JS_MarkFunc *mark_func)
+{
+	JSValue *el = JS_GetOpaque(val, dataset_class_id);
+
+	if (el != NULL) {
+		JS_MarkValue(rt, *el, mark_func);
+	}
+}
+
+/*
+ * A property name's attribute, "fooBar" to "data-foo-bar", in buf
+ * (a new allocation when it does not fit, which the caller frees), or
+ * NULL when no data attribute gives that name: a hyphen before an
+ * ASCII lower-case letter is not in one.
+ */
+static char *dataset_attr_name(const char *name, size_t len, char *buf,
+			       size_t size)
+{
+	size_t i, n = 5, need = 6;
+	char *out = buf;
+
+	for (i = 0; i < len; i++) {
+		char c = name[i];
+
+		if (c == '-' && i + 1 < len &&
+		    name[i + 1] >= 'a' && name[i + 1] <= 'z') {
+			return NULL;
+		}
+		need += (c >= 'A' && c <= 'Z') ? 2 : 1;
+	}
+	if (need > size) {
+		out = malloc(need);
+		if (out == NULL) {
+			return NULL;
+		}
+	}
+	memcpy(out, "data-", 5);
+	for (i = 0; i < len; i++) {
+		char c = name[i];
+
+		if (c >= 'A' && c <= 'Z') {
+			out[n++] = '-';
+			out[n++] = (char)(c + 32);
+		} else {
+			out[n++] = c;
+		}
+	}
+	out[n] = '\0';
+	return out;
+}
+
+/* The element and the attribute a string-keyed property names. Returns
+   the attribute's name (free with dataset_name_free), or NULL for a
+   symbol, a name no data attribute gives, or no element. */
+static char *dataset_lookup(JSContext *ctx, JSValueConst obj, JSAtom atom,
+			    char *buf, size_t size, struct dom_node **node)
+{
+	JSValue *el = JS_GetOpaque(obj, dataset_class_id);
+	JSValue key;
+	const char *s;
+	size_t len = 0;
+	char *attr;
+
+	*node = NULL;
+	if (el == NULL) {
+		return NULL;
+	}
+	key = JS_AtomToValue(ctx, atom);
+	if (!JS_IsString(key)) {
+		JS_FreeValue(ctx, key);
+		return NULL;
+	}
+	s = JS_ToCStringLen(ctx, &len, key);
+	JS_FreeValue(ctx, key);
+	if (s == NULL) {
+		return NULL;
+	}
+	attr = dataset_attr_name(s, len, buf, size);
+	JS_FreeCString(ctx, s);
+	if (attr == NULL) {
+		return NULL;
+	}
+	*node = JS_GetOpaque(*el, node_class_id);
+	if (!node_is_element(*node)) {
+		*node = NULL;
+		if (attr != buf) free(attr);
+		return NULL;
+	}
+	return attr;
+}
+
+static void dataset_name_free(char *attr, char *buf)
+{
+	if (attr != NULL && attr != buf) {
+		free(attr);
+	}
+}
+
+static int dataset_get_own_property(JSContext *ctx, JSPropertyDescriptor *desc,
+				    JSValueConst obj, JSAtom atom)
+{
+	char buf[128], *attr;
+	struct dom_node *node;
+	dom_string *key, *val = NULL;
+
+	attr = dataset_lookup(ctx, obj, atom, buf, sizeof(buf), &node);
+	if (attr == NULL) {
+		return 0;
+	}
+	vitasurf_js_attr_gets++;
+	key = to_dom_string(attr);
+	dataset_name_free(attr, buf);
+	if (key == NULL) {
+		return 0;
+	}
+	dom_element_get_attribute(node, key, &val);
+	dom_string_unref(key);
+	if (val == NULL) {
+		return 0;
+	}
+	if (desc != NULL) {
+		desc->flags = JS_PROP_C_W_E;
+		desc->getter = JS_UNDEFINED;
+		desc->setter = JS_UNDEFINED;
+		desc->value = JS_NewStringLen(ctx, dom_string_data(val),
+					      dom_string_byte_length(val));
+	}
+	dom_string_unref(val);
+	return 1;
+}
+
+/* The supported property names: each data-* attribute in order whose
+   name past "data-" has no ASCII capital, a hyphen and the lower-case
+   letter after it made that letter's capital. */
+static int dataset_get_own_property_names(JSContext *ctx,
+					  JSPropertyEnum **ptab,
+					  uint32_t *plen, JSValueConst obj)
+{
+	JSValue *el = JS_GetOpaque(obj, dataset_class_id);
+	struct dom_node *node = el != NULL ?
+		JS_GetOpaque(*el, node_class_id) : NULL;
+	struct dom_namednodemap *map = NULL;
+	JSPropertyEnum *tab;
+	uint32_t len = 0, i, n = 0;
+
+	*ptab = NULL;
+	*plen = 0;
+	if (!node_is_element(node) ||
+	    dom_node_get_attributes(node, &map) != DOM_NO_ERR || map == NULL) {
+		return 0;
+	}
+	dom_namednodemap_get_length(map, &len);
+	tab = js_malloc(ctx, sizeof(*tab) * (len > 0 ? len : 1));
+	if (tab == NULL) {
+		dom_namednodemap_unref(map);
+		return -1;
+	}
+	for (i = 0; i < len; i++) {
+		struct dom_node *a = NULL;
+		dom_string *name = NULL;
+		const char *s;
+		size_t sl, j, k;
+		char sbuf[128], *out;
+		bool ok = true;
+
+		if (dom_namednodemap_item(map, i, &a) != DOM_NO_ERR ||
+		    a == NULL) {
+			continue;
+		}
+		dom_node_get_node_name(a, &name);
+		dom_node_unref(a);
+		if (name == NULL) {
+			continue;
+		}
+		s = dom_string_data(name);
+		sl = dom_string_byte_length(name);
+		if (sl < 5 || memcmp(s, "data-", 5) != 0) {
+			dom_string_unref(name);
+			continue;
+		}
+		for (j = 5; j < sl; j++) {
+			if (s[j] >= 'A' && s[j] <= 'Z') {
+				ok = false;
+				break;
+			}
+		}
+		out = sl - 5 < sizeof(sbuf) ? sbuf : malloc(sl - 4);
+		if (!ok || out == NULL) {
+			if (out != NULL && out != sbuf) free(out);
+			dom_string_unref(name);
+			continue;
+		}
+		for (j = 5, k = 0; j < sl; j++) {
+			if (s[j] == '-' && j + 1 < sl &&
+			    s[j + 1] >= 'a' && s[j + 1] <= 'z') {
+				out[k++] = (char)(s[++j] - 32);
+			} else {
+				out[k++] = s[j];
+			}
+		}
+		tab[n].atom = JS_NewAtomLen(ctx, out, k);
+		tab[n].is_enumerable = true;
+		if (out != sbuf) free(out);
+		dom_string_unref(name);
+		if (tab[n].atom == JS_ATOM_NULL) {
+			break;
+		}
+		n++;
+	}
+	dom_namednodemap_unref(map);
+	*ptab = tab;
+	*plen = n;
+	return 0;
+}
+
+/* calls the prelude's writer or remover with the element, the property
+   name and, for a write, the value */
+static int dataset_call(JSContext *ctx, const char *fn, JSValueConst obj,
+			JSAtom atom, JSValueConst val, int argc)
+{
+	JSValue *el = JS_GetOpaque(obj, dataset_class_id);
+	JSValue f, r, argv[3];
+
+	if (el == NULL) {
+		return 0;
+	}
+	f = natives_get(ctx, fn);
+	if (!JS_IsFunction(ctx, f)) {
+		JS_FreeValue(ctx, f);
+		return 0;
+	}
+	argv[0] = *el;
+	argv[1] = JS_AtomToString(ctx, atom);
+	argv[2] = val;
+	r = JS_Call(ctx, f, JS_UNDEFINED, argc, argv);
+	JS_FreeValue(ctx, argv[1]);
+	JS_FreeValue(ctx, f);
+	if (JS_IsException(r)) {
+		return -1;
+	}
+	JS_FreeValue(ctx, r);
+	return 1;
+}
+
+static bool atom_is_string(JSContext *ctx, JSAtom atom)
+{
+	JSValue v = JS_AtomToValue(ctx, atom);
+	bool s = JS_IsString(v);
+
+	JS_FreeValue(ctx, v);
+	return s;
+}
+
+/* WebIDL's [[DefineOwnProperty]] for a named setter: a data descriptor
+   sets the attribute, an accessor is refused; a symbol is ordinary */
+static int dataset_define_own_property(JSContext *ctx, JSValueConst obj,
+				       JSAtom atom, JSValueConst val,
+				       JSValueConst getter, JSValueConst setter,
+				       int flags)
+{
+	if (!atom_is_string(ctx, atom)) {
+		return JS_DefineProperty(ctx, obj, atom, val, getter, setter,
+					 flags | JS_PROP_NO_EXOTIC);
+	}
+	if ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
+	    !(flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE))) {
+		if (flags & JS_PROP_THROW) {
+			JS_ThrowTypeError(ctx, "Failed to set a named property "
+					  "on 'DOMStringMap': not a data "
+					  "descriptor");
+			return -1;
+		}
+		return 0;
+	}
+	return dataset_call(ctx, "__vitaDatasetWrite", obj, atom,
+			    (flags & JS_PROP_HAS_VALUE) ? val : JS_UNDEFINED,
+			    3) < 0 ? -1 : 1;
+}
+
+/* [[Set]]: the named setter for any string when the map is the
+   receiver; otherwise, and for a symbol, a property of the receiver */
+static int dataset_set_property(JSContext *ctx, JSValueConst obj, JSAtom atom,
+				JSValueConst value, JSValueConst receiver,
+				int flags)
+{
+	(void)flags;
+	if (atom_is_string(ctx, atom) && JS_IsObject(receiver) &&
+	    JS_VALUE_GET_PTR(receiver) == JS_VALUE_GET_PTR(obj)) {
+		return dataset_call(ctx, "__vitaDatasetWrite", obj, atom,
+				    value, 3) < 0 ? -1 : 1;
+	}
+	if (!JS_IsObject(receiver)) {
+		return 0;
+	}
+	return JS_DefinePropertyValue(ctx, receiver, atom,
+				      JS_DupValue(ctx, value),
+				      JS_PROP_C_W_E | JS_PROP_THROW);
+}
+
+static int dataset_delete_property(JSContext *ctx, JSValueConst obj,
+				   JSAtom atom)
+{
+	if (dataset_get_own_property(ctx, NULL, obj, atom) <= 0) {
+		return 1;
+	}
+	return dataset_call(ctx, "__vitaDatasetRemove", obj, atom,
+			    JS_UNDEFINED, 2) < 0 ? -1 : 1;
+}
+
+static JSClassExoticMethods dataset_exotic = {
+	.get_own_property = dataset_get_own_property,
+	.get_own_property_names = dataset_get_own_property_names,
+	.delete_property = dataset_delete_property,
+	.define_own_property = dataset_define_own_property,
+	.set_property = dataset_set_property,
+};
+
+static JSClassDef dataset_class = {
+	"DOMStringMap",
+	.finalizer = dataset_finalizer,
+	.gc_mark = dataset_mark,
+	.exotic = &dataset_exotic,
+};
+
+/*
+ * el.dataset's getter (VitaSurf): one DOMStringMap an element, kept
+ * with its wrapper, made with the prototype interfaces.js leaves in
+ * __vitaDatasetProto. The script getter it replaced made a closure and
+ * looked the map up in a property of the element at every read, a
+ * microsecond natively, twice what reading the map then cost.
+ */
+static JSValue node_get_dataset(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node = this_element(ctx, this_val);
+	struct js_wrapper *w = NULL;
+	JSValue obj, proto, *el;
+	unsigned h;
+
+	(void)argc;
+	(void)argv;
+	if (node == NULL) {
+		return JS_ThrowTypeError(ctx, "Illegal invocation");
+	}
+	h = (unsigned)(((uintptr_t)node) >> 4) % WRAPPER_BUCKETS;
+	if (thread != NULL) {
+		jsthread *t;
+
+		w = wrapper_of(thread, node, h);
+		for (t = all_threads; w == NULL && t != NULL; t = t->all_next) {
+			if (t != thread && t->ctx != NULL && !t->closed &&
+			    t->heap == thread->heap) {
+				w = wrapper_of(t, node, h);
+			}
+		}
+	}
+	if (w != NULL && JS_IsObject(w->dataset)) {
+		return JS_DupValue(ctx, w->dataset);
+	}
+	proto = natives_get(ctx, "__vitaDatasetProto");
+	obj = JS_IsObject(proto) ?
+		JS_NewObjectProtoClass(ctx, proto, dataset_class_id) :
+		JS_NewObjectClass(ctx, dataset_class_id);
+	JS_FreeValue(ctx, proto);
+	if (JS_IsException(obj)) {
+		return obj;
+	}
+	el = js_malloc(ctx, sizeof(*el));
+	if (el == NULL) {
+		JS_FreeValue(ctx, obj);
+		return JS_EXCEPTION;
+	}
+	*el = JS_DupValue(ctx, this_val);
+	JS_SetOpaque(obj, el);
+	if (w != NULL) {
+		w->dataset = JS_DupValue(ctx, obj);
+	}
+	return obj;
 }
 
 /* __vitaIsNode(v): whether v is a node wrapper (VitaSurf) */
@@ -19303,6 +19712,10 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaHTMLDDA",
 			  JS_NewCFunction(ctx, win_vita_html_dda,
 					  "__vitaHTMLDDA", 1));
+	/* named as a getter is, being one (prelude.js) */
+	JS_SetPropertyStr(ctx, global, "__vitaDatasetGet",
+			  JS_NewCFunction(ctx, node_get_dataset,
+					  "get dataset", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaNodeProtos",
 			  JS_NewCFunction(ctx, win_vita_node_protos,
 					  "__vitaNodeProtos", 1));
@@ -19958,6 +20371,8 @@ static nserror heap_start(jsheap *ret)
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
 	JS_NewClass(ret->rt, node_class_id, &node_class);
+	JS_NewClassID(ret->rt, &dataset_class_id);
+	JS_NewClass(ret->rt, dataset_class_id, &dataset_class);
 	return NSERROR_OK;
 }
 

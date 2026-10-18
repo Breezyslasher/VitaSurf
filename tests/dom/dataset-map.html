@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<!--
+  el.dataset as the HTML standard has it (VitaSurf): a DOMStringMap whose
+  named properties are the element's data-* attributes, one object for
+  each element, read, tested, listed, set, defined and deleted as WebIDL
+  has a named property with a setter and a deleter. It had been a Proxy
+  whose traps ran in script. Each line must say PASS; Chrome passes them
+  all.
+-->
+<html><head><meta charset="utf-8"><title>dataset</title></head>
+<body>
+<div id="d" data-zjs-id="x1" data-uri="/c/1" data-a-b-c="abc" data-="empty" data-x--y="dd" title="t"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? "PASS " : "FAIL ") + name + (got === want ? "" : ": " + String(got) + ", want " + String(want))); }
+function throwsName(f) { try { f(); return "none"; } catch (e) { return e.name; } }
+var el = document.getElementById("d"), ds = el.dataset;
+ok("the same object each time", el.dataset === ds, true);
+ok("a DOMStringMap", ds instanceof DOMStringMap, true);
+ok("its tag", Object.prototype.toString.call(ds), "[object DOMStringMap]");
+ok("its prototype", Object.getPrototypeOf(ds), DOMStringMap.prototype);
+ok("the getter is on HTMLElement", typeof Object.getOwnPropertyDescriptor(HTMLElement.prototype, "dataset").get, "function");
+ok("the getter's name", Object.getOwnPropertyDescriptor(HTMLElement.prototype, "dataset").get.name, "get dataset");
+ok("no own property on the element", Object.getOwnPropertyNames(el).length, 0);
+ok("read", ds.zjsId, "x1");
+ok("read another", ds.uri, "/c/1");
+ok("several hyphens", ds.aBC, "abc");
+ok("data- alone", ds[""], "empty");
+ok("two hyphens", ds["x-Y"], "dd");
+ok("the attribute's own spelling is not a name", ds["zjs-id"], undefined);
+ok("a missing one", ds.nothing, undefined);
+ok("in", "zjsId" in ds, true);
+ok("not in", "zjs-id" in ds, false);
+ok("a prototype's member when no attribute has its name", typeof ds.toString, "function");
+ok("hasOwnProperty", Object.prototype.hasOwnProperty.call(ds, "uri"), true);
+ok("keys in attribute order", Object.keys(ds).join(","), "zjsId,uri,aBC,,x-Y");
+ok("JSON", JSON.stringify(ds), '{"zjsId":"x1","uri":"/c/1","aBC":"abc","":"empty","x-Y":"dd"}');
+var dsc = Object.getOwnPropertyDescriptor(ds, "uri");
+ok("descriptor", dsc && [dsc.value, dsc.writable, dsc.enumerable, dsc.configurable].join(","), "/c/1,true,true,true");
+ok("no descriptor for a missing one", Object.getOwnPropertyDescriptor(ds, "nothing"), undefined);
+ds.fooBar = 12;
+ok("set makes the attribute", el.getAttribute("data-foo-bar"), "12");
+ok("and reads back as a string", ds.fooBar, "12");
+ds.uri = "/c/2";
+ok("set replaces it", el.getAttribute("data-uri"), "/c/2");
+ds.toString = "s";
+ok("a prototype's name is set as an attribute", el.getAttribute("data-to-string"), "s");
+ok("and then read", ds.toString, "s");
+delete ds.toString;
+ok("set a hyphen before a small letter", throwsName(function () { ds["foo-bar"] = 1; }), "SyntaxError");
+ok("set a number", (ds[0] = "n", el.getAttribute("data-0")), "n");
+Object.defineProperty(ds, "def", { value: "v" });
+ok("defineProperty with a value", el.getAttribute("data-def"), "v");
+ok("defineProperty with an accessor", throwsName(function () { Object.defineProperty(ds, "acc", { get: function () { return 1; } }); }), "TypeError");
+ok("and nothing set", el.hasAttribute("data-acc"), false);
+ok("Reflect.defineProperty of an accessor", Reflect.defineProperty(ds, "acc", { get: function () { return 1; } }), false);
+ok("delete", delete ds.fooBar, true);
+ok("removes the attribute", el.hasAttribute("data-foo-bar"), false);
+ok("delete a missing one", delete ds.nothing, true);
+var sym = Symbol("s");
+ds[sym] = 5;
+ok("a symbol is an ordinary property", ds[sym], 5);
+ok("and no attribute", el.attributes.length, 9);
+ok("symbols", Object.getOwnPropertySymbols(ds).length, 1);
+ok("delete a symbol", (delete ds[sym], ds[sym]), undefined);
+ok("spread", JSON.stringify(Object.assign({}, { ...document.createElement("b").dataset })), "{}");
+ok("setAttribute shows at once", (el.setAttribute("data-late", "L"), ds.late), "L");
+ok("removeAttribute too", (el.removeAttribute("data-late"), ds.late), undefined);
+var recs = [];
+var mo = new MutationObserver(function () {});
+mo.observe(el, { attributes: true, attributeOldValue: true });
+ds.zjsId = "x2";
+recs = mo.takeRecords();
+ok("an observer sees a write", recs.length === 1 && recs[0].attributeName + "=" + recs[0].oldValue, "data-zjs-id=x1");
+delete ds.zjsId;
+recs = mo.takeRecords();
+ok("and a delete", recs.length === 1 && recs[0].attributeName, "data-zjs-id");
+mo.disconnect();
+var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+svg.setAttribute("data-k", "v");
+ok("an SVG element's", svg.dataset && svg.dataset.k, "v");
+ok("for..in", (function () { var k = []; for (var n in ds) k.push(n); return k.join(","); })(), "uri,aBC,,x-Y,0,def");
+document.getElementById("out").textContent = out.join("\n");
+out.forEach(function (l) { console.log("dataset-map: " + l); });
+console.log("dataset-map: done");
+</script>
+</body></html>

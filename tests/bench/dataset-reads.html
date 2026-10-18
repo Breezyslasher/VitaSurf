@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!--
+  el.dataset read the way cnn.com's analytics read it: the getter, a
+  named property, and Object.keys() of the map (VitaSurf). The map had
+  been a Proxy with its traps in script; natively 40,000 reads took 52 to
+  76 ms and 20,000 Object.keys() 206 ms, and with the DOMStringMap made
+  in C 12 to 18 ms and 16 to 23 ms.
+-->
+<html><head><meta charset="utf-8"><title>dataset reads</title></head>
+<body><div id="root"></div><script>
+var root = document.getElementById("root"), els = [], dss = [];
+for (var i = 0; i < 1000; i++) {
+  var d = document.createElement("div");
+  d.setAttribute("data-zjs-id", "x" + i);
+  d.setAttribute("data-uri", "/c/" + i);
+  root.appendChild(d); els.push(d); dss.push(d.dataset);
+}
+var n = 0, t0 = performance.now();
+for (var r = 0; r < 20; r++) for (var i = 0; i < els.length; i++) { if (els[i].dataset.zjsId) n++; if (els[i].dataset.uri) n++; }
+var t1 = performance.now();
+for (var r = 0; r < 40; r++) for (var i = 0; i < els.length; i++) { if (els[i].dataset) n++; }
+var t2 = performance.now();
+for (var r = 0; r < 20; r++) for (var i = 0; i < els.length; i++) { if (dss[i].zjsId) n++; if (dss[i].uri) n++; }
+var t3 = performance.now();
+for (var r = 0; r < 20; r++) for (var i = 0; i < els.length; i++) n += Object.keys(els[i].dataset).length;
+var t4 = performance.now();
+for (var i = 0; i < els.length; i++) els[i].dataset.zjsSeen = "1";
+var t5 = performance.now();
+console.log("dataset-reads: 40000 reads " + (t1 - t0).toFixed(1) + " ms, 40000 getters " + (t2 - t1).toFixed(1) +
+  " ms, 40000 map reads " + (t3 - t2).toFixed(1) + " ms, 20000 Object.keys " + (t4 - t3).toFixed(1) +
+  " ms, 1000 writes " + (t5 - t4).toFixed(1) + " ms (" + n + ")");
+</script></body></html>
