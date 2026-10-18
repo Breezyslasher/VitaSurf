@@ -98,6 +98,9 @@
 /* ------------------------------------------------------------------------ */
 /* Heap and thread                                                          */
 
+/* the prelude and its four units */
+#define HEAP_TEMPLATES 5
+
 struct jsheap {
 	JSRuntime *rt;
 	struct qjs_pool *pool;  /**< the runtime's small-block allocator */
@@ -121,6 +124,13 @@ struct jsheap {
 	uint32_t closed_gc_runs;
 	/* the runtime's memory limit, in KB */
 	unsigned int limit_kb;
+	/*
+	 * The prelude's function tree, and each unit's once one has run,
+	 * as templates for this runtime's realms (VitaSurf): see
+	 * heap_function.
+	 */
+	JSValue tmpl[HEAP_TEMPLATES];
+	bool has_tmpl[HEAP_TEMPLATES];
 };
 
 struct js_listener;
@@ -19824,6 +19834,58 @@ static struct prelude_unit prelude_units[] = {
 	  prelude_wasm_js, sizeof(prelude_wasm_js) - 1, NULL, 0 },
 };
 
+/*
+ * A realm's copy of the prelude or a unit (VitaSurf). Reading the
+ * prelude's bytecode back was 50 ms of every realm's 280 ms on the
+ * device, for a tree that is the same in every realm of a runtime but
+ * for the realm its functions run in. The first realm of a runtime
+ * reads it and makes it the runtime's template, and each realm then
+ * gets a clone, which shares the template's code, names and positions
+ * (JS_CloneFunctionTemplate). fn is what was read or compiled, or
+ * JS_UNDEFINED to ask for the template alone; a tree that cannot be a
+ * template is handed back as it was.
+ */
+static JSValue heap_function(JSContext *ctx, int slot, JSValue fn)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	jsheap *heap = thread != NULL ? thread->heap : NULL;
+
+	if (heap == NULL)
+		return fn;
+	if (heap->has_tmpl[slot]) {
+		JS_FreeValue(ctx, fn);
+		return JS_CloneFunctionTemplate(ctx, heap->tmpl[slot]);
+	}
+	if (JS_IsException(fn) || JS_IsUndefined(fn) ||
+	    JS_MakeFunctionTemplate(ctx, fn) != 0)
+		return fn;
+	heap->tmpl[slot] = fn;
+	heap->has_tmpl[slot] = true;
+	return JS_CloneFunctionTemplate(ctx, fn);
+}
+
+/* whether this runtime has the template of slot */
+static bool heap_has_function(JSContext *ctx, int slot)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	return thread != NULL && thread->heap != NULL &&
+		thread->heap->has_tmpl[slot];
+}
+
+/* let go of a runtime's templates, before it is freed */
+static void heap_drop_functions(jsheap *heap)
+{
+	int i;
+
+	for (i = 0; i < HEAP_TEMPLATES; i++) {
+		if (heap->has_tmpl[i]) {
+			JS_FreeValueRT(heap->rt, heap->tmpl[i]);
+			heap->has_tmpl[i] = false;
+		}
+	}
+}
+
 /* run a unit in this context; reason is what the page touched */
 static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
 			     const char *reason)
@@ -19833,9 +19895,14 @@ static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
 	uint64_t t0 = now_ms(), t1;
 	JSValue fn, r;
 	bool ok = true;
+	int slot = 1 + (int)(u - prelude_units);
 
-	if (u->bc != NULL) {
+	if (heap_has_function(ctx, slot)) {
+		fn = heap_function(ctx, slot, JS_UNDEFINED);
+		how = "template";
+	} else if (u->bc != NULL) {
 		fn = JS_ReadObject(ctx, u->bc, u->bc_len, JS_READ_OBJ_BYTECODE);
+		fn = heap_function(ctx, slot, fn);
 	} else {
 		fn = bc_load(ctx, u->url, src, u->len);
 		if (JS_IsUndefined(fn)) {
@@ -19864,6 +19931,7 @@ static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
 				}
 				js_free(ctx, out);
 			}
+			fn = heap_function(ctx, slot, fn);
 		}
 	}
 	if (JS_IsException(fn)) {
@@ -20487,9 +20555,13 @@ static bool setup_globals(jsthread *thread)
 		 * rather than once per boot.
 		 */
 		nsu_getmonotonic_ms(&t0);
-		if (prelude_bc != NULL) {
+		if (heap_has_function(ctx, 0)) {
+			fn = heap_function(ctx, 0, JS_UNDEFINED);
+			how = "template";
+		} else if (prelude_bc != NULL) {
 			fn = JS_ReadObject(ctx, prelude_bc, prelude_bc_len,
 					   JS_READ_OBJ_BYTECODE);
+			fn = heap_function(ctx, 0, fn);
 		} else {
 			fn = bc_load(ctx, PRELUDE_URL, src, len);
 			if (JS_IsUndefined(fn)) {
@@ -20516,6 +20588,7 @@ static bool setup_globals(jsthread *thread)
 					prelude_bc_len = out_len;
 				}
 			}
+			fn = heap_function(ctx, 0, fn);
 		}
 		/* reading or compiling it, apart from running it */
 		nsu_getmonotonic_ms(&tr);
@@ -20833,6 +20906,7 @@ void js_destroyheap(jsheap *heap)
 		if (qjs_memory_rt == heap->rt)
 			qjs_memory_rt = NULL;
 		qjs_miss_drop(heap->rt);
+		heap_drop_functions(heap);
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 	}
@@ -21379,6 +21453,7 @@ void js_destroythread(jsthread *thread)
 		if (qjs_memory_rt == heap->rt)
 			qjs_memory_rt = NULL;
 		qjs_miss_drop(heap->rt);
+		heap_drop_functions(heap);
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 		free(heap);
