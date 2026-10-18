@@ -8747,6 +8747,410 @@ static JSValue node_get_dataset(JSContext *ctx, JSValueConst this_val,
 	return obj;
 }
 
+/*
+ * A live collection, an HTMLCollection or NodeList (VitaSurf): its
+ * indexed properties are the items the prelude's function for it gives,
+ * kept until the tree changes (the counters the prelude reads as
+ * domGen() and treeGen()), and read here; a name the prototype chain
+ * does not have is the collection's namedItem(), as WebIDL's named
+ * properties are. It had been a Proxy whose get trap ran in script for
+ * every read, with the index made a string and read back: a loop over
+ * one read 13 times slower than over a static list, and Amazon's
+ * jQuery cleanData, walking every element of a subtree so, had it a
+ * tenth of its profile in build 793's log.
+ */
+static JSClassID live_coll_class_id;
+
+struct live_coll {
+	JSValue items;		/**< the prelude's function giving the items */
+	JSValue cache;		/**< what it last gave, or undefined */
+	JSValue getter;		/**< __vitaItems, for the prelude's own use */
+	JSAtom getter_atom;	/**< its name */
+	uint32_t gen;		/**< the counter when it gave them */
+	bool shape;		/**< kept by the tree's shape alone */
+};
+
+static void live_coll_finalizer(JSRuntime *rt, JSValue val)
+{
+	struct live_coll *lc = JS_GetOpaque(val, live_coll_class_id);
+
+	if (lc != NULL) {
+		JS_FreeValueRT(rt, lc->items);
+		JS_FreeValueRT(rt, lc->cache);
+		JS_FreeValueRT(rt, lc->getter);
+		JS_FreeAtomRT(rt, lc->getter_atom);
+		js_free_rt(rt, lc);
+	}
+}
+
+static void live_coll_mark(JSRuntime *rt, JSValueConst val,
+			   JS_MarkFunc *mark_func)
+{
+	struct live_coll *lc = JS_GetOpaque(val, live_coll_class_id);
+
+	if (lc != NULL) {
+		JS_MarkValue(rt, lc->items, mark_func);
+		JS_MarkValue(rt, lc->cache, mark_func);
+		JS_MarkValue(rt, lc->getter, mark_func);
+	}
+}
+
+/* the items as they are now, a new reference, or an exception */
+static JSValue live_coll_items(JSContext *ctx, struct live_coll *lc)
+{
+	uint32_t g = lc->shape ? vita_tree_gen : vita_dom_gen;
+	JSValue v;
+
+	if (JS_IsUndefined(lc->cache) || lc->gen != g) {
+		v = JS_Call(ctx, lc->items, JS_UNDEFINED, 0, NULL);
+		if (JS_IsException(v)) {
+			return v;
+		}
+		JS_FreeValue(ctx, lc->cache);
+		lc->cache = v;
+		lc->gen = g;
+	}
+	return JS_DupValue(ctx, lc->cache);
+}
+
+/* how QuickJS marks an atom that is an integer below 2^31
+   (JS_ATOM_TAG_INT in quickjs.c) */
+#define LIVE_ATOM_TAG_INT (1U << 31)
+
+/*
+ * Whether a property key is an array index, and which: 1, 0, or -1 for
+ * an exception. An index below 2^31 is an integer atom, read from the
+ * atom itself (JS_AtomToValue would make it a string); a larger one,
+ * to 2^32 - 2, is its canonical decimal string, ten digits.
+ */
+static int live_coll_index(JSContext *ctx, JSAtom atom, uint32_t *idx)
+{
+	JSValue v;
+	const char *s;
+	size_t len = 0, i;
+	uint64_t n = 0;
+	int ret = 0;
+
+	if (atom & LIVE_ATOM_TAG_INT) {
+		*idx = atom & ~LIVE_ATOM_TAG_INT;
+		return 1;
+	}
+	v = JS_AtomToValue(ctx, atom);
+	if (!JS_IsString(v)) {
+		JS_FreeValue(ctx, v);
+		return JS_IsException(v) ? -1 : 0;
+	}
+	s = JS_ToCStringLen(ctx, &len, v);
+	JS_FreeValue(ctx, v);
+	if (s == NULL) {
+		return -1;
+	}
+	if (len == 10 && s[0] >= '1' && s[0] <= '9') {
+		for (i = 0; i < len && s[i] >= '0' && s[i] <= '9'; i++) {
+			n = n * 10 + (uint64_t)(s[i] - '0');
+		}
+		if (i == len && n <= 0xfffffffeu) {
+			*idx = (uint32_t)n;
+			ret = 1;
+		}
+	}
+	JS_FreeCString(ctx, s);
+	return ret;
+}
+
+/* the item at an index, a new reference, or undefined past the end */
+static JSValue live_coll_item(JSContext *ctx, struct live_coll *lc,
+			      uint32_t idx)
+{
+	JSValue a = live_coll_items(ctx, lc), v;
+
+	if (JS_IsException(a)) {
+		return a;
+	}
+	v = JS_GetPropertyUint32(ctx, a, idx);
+	JS_FreeValue(ctx, a);
+	return v;
+}
+
+/* namedItem(name) for a name the prototype chain does not have: a new
+   reference to the element, or null when the collection has none */
+static JSValue live_coll_named(JSContext *ctx, JSValueConst obj, JSAtom atom)
+{
+	JSValue proto, f, name, r;
+	int has;
+
+	if (!atom_is_string(ctx, atom)) {
+		return JS_NULL;
+	}
+	proto = JS_GetPrototype(ctx, obj);
+	if (JS_IsException(proto)) {
+		return proto;
+	}
+	has = JS_IsObject(proto) ? JS_HasProperty(ctx, proto, atom) : 0;
+	if (has != 0) {
+		JS_FreeValue(ctx, proto);
+		return has < 0 ? JS_EXCEPTION : JS_NULL;
+	}
+	f = JS_IsObject(proto) ? JS_GetPropertyStr(ctx, proto, "namedItem") :
+		JS_UNDEFINED;
+	JS_FreeValue(ctx, proto);
+	if (JS_IsException(f)) {
+		return f;
+	}
+	if (!JS_IsFunction(ctx, f)) {
+		JS_FreeValue(ctx, f);
+		return JS_NULL;
+	}
+	name = JS_AtomToString(ctx, atom);
+	r = JS_Call(ctx, f, obj, 1, &name);
+	JS_FreeValue(ctx, name);
+	JS_FreeValue(ctx, f);
+	if (!JS_IsException(r) && !JS_IsObject(r)) {
+		JS_FreeValue(ctx, r);
+		return JS_NULL;
+	}
+	return r;
+}
+
+static int live_coll_get_own_property(JSContext *ctx,
+				      JSPropertyDescriptor *desc,
+				      JSValueConst obj, JSAtom atom)
+{
+	struct live_coll *lc = JS_GetOpaque(obj, live_coll_class_id);
+	uint32_t idx;
+	JSValue v;
+	int k;
+
+	if (lc == NULL) {
+		return 0;
+	}
+	k = live_coll_index(ctx, atom, &idx);
+	if (k < 0) {
+		return -1;
+	}
+	if (k > 0) {
+		v = live_coll_item(ctx, lc, idx);
+		if (JS_IsException(v)) {
+			return -1;
+		}
+		if (JS_IsUndefined(v)) {
+			return 0;
+		}
+		if (desc != NULL) {
+			desc->flags = JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE;
+			desc->value = v;
+			desc->getter = JS_UNDEFINED;
+			desc->setter = JS_UNDEFINED;
+		} else {
+			JS_FreeValue(ctx, v);
+		}
+		return 1;
+	}
+	/* the prelude's own way in, which a key listing leaves out */
+	if (atom == lc->getter_atom) {
+		if (desc != NULL) {
+			desc->flags = JS_PROP_CONFIGURABLE;
+			desc->value = JS_DupValue(ctx, lc->getter);
+			desc->getter = JS_UNDEFINED;
+			desc->setter = JS_UNDEFINED;
+		}
+		return 1;
+	}
+	v = live_coll_named(ctx, obj, atom);
+	if (JS_IsException(v)) {
+		return -1;
+	}
+	if (JS_IsNull(v)) {
+		return 0;
+	}
+	if (desc != NULL) {
+		desc->flags = JS_PROP_CONFIGURABLE;
+		desc->value = v;
+		desc->getter = JS_UNDEFINED;
+		desc->setter = JS_UNDEFINED;
+	} else {
+		JS_FreeValue(ctx, v);
+	}
+	return 1;
+}
+
+/* the indices, then the names (the prelude's __vitaCollectionNames
+   lists the ids and names the items answer to) */
+static int live_coll_get_own_property_names(JSContext *ctx,
+					    JSPropertyEnum **ptab,
+					    uint32_t *plen, JSValueConst obj)
+{
+	struct live_coll *lc = JS_GetOpaque(obj, live_coll_class_id);
+	JSPropertyEnum *tab;
+	JSValue a, f, names = JS_UNDEFINED;
+	int64_t n = 0, m = 0;
+	uint32_t i, k = 0;
+
+	*ptab = NULL;
+	*plen = 0;
+	if (lc == NULL) {
+		return 0;
+	}
+	a = live_coll_items(ctx, lc);
+	if (JS_IsException(a) || JS_GetLength(ctx, a, &n) < 0) {
+		JS_FreeValue(ctx, a);
+		return -1;
+	}
+	f = natives_get(ctx, "__vitaCollectionNames");
+	if (JS_IsFunction(ctx, f)) {
+		names = JS_Call(ctx, f, JS_UNDEFINED, 1, (JSValueConst *)&a);
+		if (JS_IsException(names) ||
+		    JS_GetLength(ctx, names, &m) < 0) {
+			JS_FreeValue(ctx, f);
+			JS_FreeValue(ctx, a);
+			JS_FreeValue(ctx, names);
+			return -1;
+		}
+	}
+	JS_FreeValue(ctx, f);
+	JS_FreeValue(ctx, a);
+	tab = js_malloc(ctx, sizeof(*tab) * (size_t)(n + m > 0 ? n + m : 1));
+	if (tab == NULL) {
+		JS_FreeValue(ctx, names);
+		return -1;
+	}
+	for (i = 0; i < (uint32_t)n; i++) {
+		tab[k].atom = JS_NewAtomUInt32(ctx, i);
+		tab[k].is_enumerable = true;
+		if (tab[k].atom == JS_ATOM_NULL) {
+			break;
+		}
+		k++;
+	}
+	for (i = 0; i < (uint32_t)m && k == (uint32_t)n + i; i++) {
+		JSValue s = JS_GetPropertyUint32(ctx, names, i);
+
+		tab[k].atom = JS_ValueToAtom(ctx, s);
+		tab[k].is_enumerable = false;
+		JS_FreeValue(ctx, s);
+		if (tab[k].atom == JS_ATOM_NULL) {
+			break;
+		}
+		k++;
+	}
+	JS_FreeValue(ctx, names);
+	*ptab = tab;
+	*plen = k;
+	return 0;
+}
+
+/* an index is not defined on it; anything else is an ordinary
+   property, as the Proxy's defineProperty trap had it */
+static int live_coll_define_own_property(JSContext *ctx, JSValueConst obj,
+					 JSAtom atom, JSValueConst val,
+					 JSValueConst getter,
+					 JSValueConst setter, int flags)
+{
+	uint32_t idx;
+	int k = live_coll_index(ctx, atom, &idx);
+
+	if (k < 0) {
+		return -1;
+	}
+	if (k > 0) {
+		if (flags & JS_PROP_THROW) {
+			JS_ThrowTypeError(ctx, "Failed to set an indexed "
+					  "property on a collection: Indexed "
+					  "property setter is not supported.");
+			return -1;
+		}
+		return 0;
+	}
+	return JS_DefineProperty(ctx, obj, atom, val, getter, setter,
+				 flags | JS_PROP_NO_EXOTIC);
+}
+
+/* [[Delete]]: an index or name it has is not deleted */
+static int live_coll_delete_property(JSContext *ctx, JSValueConst obj,
+				     JSAtom atom)
+{
+	int k = live_coll_get_own_property(ctx, NULL, obj, atom);
+
+	return k < 0 ? -1 : !k;
+}
+
+static JSClassExoticMethods live_coll_exotic = {
+	.get_own_property = live_coll_get_own_property,
+	.get_own_property_names = live_coll_get_own_property_names,
+	.delete_property = live_coll_delete_property,
+	.define_own_property = live_coll_define_own_property,
+};
+
+static JSClassDef live_coll_class = {
+	"LiveCollection",
+	.finalizer = live_coll_finalizer,
+	.gc_mark = live_coll_mark,
+	.exotic = &live_coll_exotic,
+};
+
+/*
+ * this.__vitaItems(): the collection's items as they are now. this can
+ * be a Proxy over the collection (document.all is one) or an object
+ * made from it, as the closure this was found it for either.
+ */
+static JSValue win_vita_live_items(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	struct live_coll *lc = JS_GetOpaque(this_val, live_coll_class_id);
+	JSValue o = JS_DupValue(ctx, this_val), next;
+	int steps;
+
+	(void)argc;
+	(void)argv;
+	for (steps = 0; lc == NULL && steps < 32 && JS_IsObject(o); steps++) {
+		next = JS_IsProxy(o) ? JS_GetProxyTarget(ctx, o) :
+			JS_GetPrototype(ctx, o);
+		JS_FreeValue(ctx, o);
+		if (JS_IsException(next)) {
+			return next;
+		}
+		o = next;
+		lc = JS_GetOpaque(o, live_coll_class_id);
+	}
+	JS_FreeValue(ctx, o);
+	if (lc == NULL) {
+		return JS_ThrowTypeError(ctx, "Illegal invocation");
+	}
+	return live_coll_items(ctx, lc);
+}
+
+/* __vitaLiveCollection(proto, items, shapeOnly) */
+static JSValue win_vita_live_collection(JSContext *ctx, JSValueConst this_val,
+					int argc, JSValueConst *argv)
+{
+	struct live_coll *lc;
+	JSValue obj;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0]) ||
+	    !JS_IsFunction(ctx, argv[1])) {
+		return JS_ThrowTypeError(ctx, "a prototype and a function "
+					 "expected");
+	}
+	obj = JS_NewObjectProtoClass(ctx, argv[0], live_coll_class_id);
+	if (JS_IsException(obj)) {
+		return obj;
+	}
+	lc = js_malloc(ctx, sizeof(*lc));
+	if (lc == NULL) {
+		JS_FreeValue(ctx, obj);
+		return JS_EXCEPTION;
+	}
+	lc->items = JS_DupValue(ctx, argv[1]);
+	lc->cache = JS_UNDEFINED;
+	lc->getter = natives_get(ctx, "__vitaLiveItems");
+	lc->getter_atom = JS_NewAtom(ctx, "__vitaItems");
+	lc->gen = 0;
+	lc->shape = argc > 2 && JS_ToBool(ctx, argv[2]);
+	JS_SetOpaque(obj, lc);
+	return obj;
+}
+
 /* __vitaIsNode(v): whether v is a node wrapper (VitaSurf) */
 static JSValue win_vita_is_node(JSContext *ctx, JSValueConst this_val,
 				int argc, JSValueConst *argv)
@@ -19742,6 +20146,12 @@ static bool setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_html_dda,
 					  "__vitaHTMLDDA", 1));
 	/* named as a getter is, being one (prelude.js) */
+	JS_SetPropertyStr(ctx, global, "__vitaLiveCollection",
+			  JS_NewCFunction(ctx, win_vita_live_collection,
+					  "__vitaLiveCollection", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaLiveItems",
+			  JS_NewCFunction(ctx, win_vita_live_items,
+					  "__vitaItems", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaDatasetGet",
 			  JS_NewCFunction(ctx, node_get_dataset,
 					  "get dataset", 0));
@@ -20402,6 +20812,8 @@ static nserror heap_start(jsheap *ret)
 	JS_NewClass(ret->rt, node_class_id, &node_class);
 	JS_NewClassID(ret->rt, &dataset_class_id);
 	JS_NewClass(ret->rt, dataset_class_id, &dataset_class);
+	JS_NewClassID(ret->rt, &live_coll_class_id);
+	JS_NewClass(ret->rt, live_coll_class_id, &live_coll_class);
 	return NSERROR_OK;
 }
 

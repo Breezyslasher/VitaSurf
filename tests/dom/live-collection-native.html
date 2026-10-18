@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<!-- A live collection (getElementsByTagName and the rest, children,
+     form.elements) had been a Proxy
+     whose traps ran in script, so a loop reading [i] ran a call into
+     the prelude, a string made of the index and read back, at every
+     step: 13 times slower than a static list, and a tenth of Amazon's
+     script in build 793's log. It is now made in C (__vitaLiveCollection
+     in qjs.c). These are what Chrome gives, and the page must not be
+     able to tell the difference otherwise.
+     Expected: PASS lines. -->
+<html><body>
+<form id="f" name="login"><input name="user" id="u"><input name="pass"></form>
+<p id="a">a</p><p id="length">b</p><p name="nm">c</p><img name="pic" src="data:,">
+<script>
+'use strict';
+function say(ok, what) { console.log((ok ? 'PASS' : 'FAIL') + ' ' + what); }
+var ps = document.getElementsByTagName('p');
+
+say(ps.length === 3 && ps[0].id === 'a' && ps[2].textContent === 'c' &&
+    ps[3] === undefined && ps['1'] === ps[1], 'indices read the items');
+say(0 in ps && !(3 in ps) && ps.item(1) === ps[1] && ps.item(9) === null,
+    'in and item() agree with the indices');
+var d = Object.getOwnPropertyDescriptor(ps, 0);
+say(d && d.value === ps[0] && d.writable === false && d.enumerable === true &&
+    d.configurable === true, 'an index is a read-only, enumerable, configurable property');
+say(ps.a === ps[0] && ps.namedItem('a') === ps[0], 'an id is a named property');
+say(typeof ps.length === 'number' && ps.namedItem('length') === ps[1],
+    'a name the prototype has is the prototype\'s (length stays the count)');
+say(ps.nm === undefined, 'a p does not answer to its name attribute');
+var imgs = document.getElementsByTagName('img');
+say(imgs.pic === imgs[0], 'an img answers to its name attribute');
+var nd = Object.getOwnPropertyDescriptor(ps, 'a');
+say(nd && nd.enumerable === false && nd.writable === false && nd.configurable === true,
+    'a named property is not enumerable');
+say(JSON.stringify(Object.keys(ps)) === '["0","1","2"]',
+    'Object.keys lists the indices (' + JSON.stringify(Object.keys(ps)) + ')');
+say(JSON.stringify(Object.getOwnPropertyNames(ps)) === '["0","1","2","a","length"]',
+    'getOwnPropertyNames lists the indices, then the ids (' +
+    JSON.stringify(Object.getOwnPropertyNames(ps)) + ')');
+var threw = false;
+try { ps[0] = 1; } catch (e) { threw = e instanceof TypeError; }
+say(threw && ps[0].id === 'a', 'assigning an index throws in strict code');
+threw = false;
+try { Object.defineProperty(ps, '1', { value: 1 }); } catch (e) { threw = e instanceof TypeError; }
+say(threw && ps[1].id === 'length', 'defining an index throws');
+say(Reflect.defineProperty(ps, '5', { value: 1 }) === false, 'Reflect.defineProperty of an index is false');
+threw = false;
+try { delete ps[0]; } catch (e) { threw = e instanceof TypeError; }
+say(threw && ps.length === 3, 'deleting an index it has throws in strict code');
+say(delete ps[7] === true, 'deleting an index it does not have is true');
+ps.extra = 5;
+say(ps.extra === 5 && Object.keys(ps).indexOf('extra') >= 0, 'any other property is ordinary');
+var sym = Symbol('s'); ps[sym] = 1;
+say(ps[sym] === 1, 'a symbol is ordinary');
+say(Object.getOwnPropertyNames(ps).indexOf('__vitaItems') < 0 &&
+    Object.keys(ps).indexOf('__vitaItems') < 0, 'nothing of the browser\'s own is listed');
+
+var p = document.createElement('p'); p.id = 'z';
+document.body.appendChild(p);
+say(ps.length === 4 && ps[3] === p && ps.z === p, 'it is live');
+document.body.removeChild(p);
+say(ps.length === 3 && ps[3] === undefined && ps.z === undefined, 'and goes on being live');
+
+var f = document.getElementById('f');
+say(f.elements.length === 2 && f.elements.user === f.elements[0] &&
+    f.elements.pass === f.elements[1], 'form.elements answers to every control\'s name');
+say(document.forms.login === f, 'document.forms answers to a form\'s name');
+var all = document.all;
+say(all[0] === document.documentElement && all.length > 6 && all.a === ps[0],
+    'document.all reads through');
+var der = Object.create(ps);
+say(der.length === 3 && der[0] === ps[0], 'an object made from it reads its items');
+var n = 0, e;
+for (var i = 0; (e = ps[i]) !== undefined; i++) n++;
+var it = 0; for (var x of ps) it++;
+say(n === 3 && it === 3 && Array.from(ps).length === 3 && [].slice.call(ps).length === 3,
+    'loops, iteration and Array.from');
+say(Object.prototype.toString.call(ps) === '[object HTMLCollection]' &&
+    ps instanceof HTMLCollection && !Array.isArray(ps), 'it is an HTMLCollection');
+</script></body></html>

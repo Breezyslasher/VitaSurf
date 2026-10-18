@@ -6319,9 +6319,7 @@ HTMLCollection.prototype[Symbol.iterator]=function(){
 /* Only these tags answer to their name attribute in a collection. */
 var NAMED_TAGS=(' A APPLET AREA EMBED FORM FRAME FRAMESET IFRAME IMG '+
  'OBJECT ');
-/* an array index, by its characters (VitaSurf): a regular expression
-   at every read of a collection's item was a good part of a loop over
-   one */
+/* an array index, by its characters (VitaSurf) */
 function indexKey(k){
  if(typeof k!=='string')return -1;
  var n=k.length,c,i;
@@ -6332,73 +6330,28 @@ function indexKey(k){
  for(i=1;i<n;i++){c=k.charCodeAt(i);if(c<48||c>57)return -1;}
  c=+k;
  return c<=0xfffffffe?c:-1;}
-/* The collection is a proxy so that an index or a name is resolved when
-   it is read, which is what makes it live. */
+/* The collection is made in C (__vitaLiveCollection in qjs.c), which
+   reads an index or a name when it is asked for, which is what makes it
+   live: an index from the items the function gives, kept until the C
+   side says the tree changed (a loop over a collection reads .length
+   and [i] each step, and each read had been a whole-document walk), a
+   name the prototype chain does not have from namedItem(). It had been
+   a Proxy whose get trap ran here for every read. */
 function liveCollection(items,proto,shapeOnly){
- var base=Object.create(proto||HTMLCollection.prototype),cache=null,gen=-1,
-     now=shapeOnly?treeGen:domGen;
- /* Live, but not by asking again on every read: the answer is kept
-    until the C side says the tree changed. A loop over a collection
-    reads .length and [i] each step, and each read was a whole-document
-    walk before this. */
- function cached(){
-  var g=now();
-  if(cache===null||g<0||g!==gen){cache=items();gen=g;}
-  return cache;}
- Object.defineProperty(base,'__vitaItems',{value:cached,configurable:true});
- return new Proxy(base,{
-  get:function(t,k,r){
-   var i=indexKey(k),a;
-   /* this collection's own items, not looked up through it (VitaSurf):
-      a loop over a collection reads [i] and length at every step */
-   if(i>=0){a=cached();return i<a.length?a[i]:undefined;}
-   /* the length getter on the collection itself, which reads its
-      items there rather than through the proxy a second time */
-   if(k==='length')return Reflect.get(t,k,t);
-   if(typeof k==='string'&&!(k in t)&&k!=='__vitaItems'){
-    var n=t.namedItem?t.namedItem(k):null;
-    if(n)return n;}
-   return Reflect.get(t,k,r);},
-  has:function(t,k){
-   var i=indexKey(k);
-   if(i>=0)return i<cached().length;
-   if(typeof k==='string'&&t.namedItem&&t.namedItem(k))return true;
-   return Reflect.has(t,k);},
-  set:function(t,k,v,r){
-   /* an index, or a name the collection answers to, is not writable */
-   if(indexKey(k)>=0)return false;
-   if(typeof k==='string'&&t.namedItem&&t.namedItem(k))return false;
-   return Reflect.set(t,k,v,r);},
-  deleteProperty:function(t,k){
-   if(indexKey(k)>=0)return false;
-   if(typeof k==='string'&&t.namedItem&&t.namedItem(k))return false;
-   return Reflect.deleteProperty(t,k);},
-  defineProperty:function(t,k,d){
-   if(indexKey(k)>=0)return false;
-   return Reflect.defineProperty(t,k,d);},
-  ownKeys:function(t){
-   var a=t.__vitaItems(),out=[],seen={},i,n;
-   for(i=0;i<a.length;i++)out.push(String(i));
-   for(i=0;i<a.length;i++){
-    if(!a[i].getAttribute)continue;
-    n=a[i].getAttribute('id');
-    if(n&&!seen[n]&&indexKey(n)<0){seen[n]=1;out.push(n);}
-    if(NAMED_TAGS.indexOf(' '+a[i].tagName+' ')>=0){
-     n=a[i].getAttribute('name');
-     if(n&&!seen[n]&&indexKey(n)<0){seen[n]=1;out.push(n);}}}
-   Reflect.ownKeys(t).forEach(function(k){
-    if(typeof k==='string'&&out.indexOf(k)<0&&k!=='__vitaItems')out.push(k);});
-   return out;},
-  getOwnPropertyDescriptor:function(t,k){
-   var i=indexKey(k),a;
-   if(i>=0){
-    a=t.__vitaItems();
-    if(i>=a.length)return undefined;
-    return {value:a[i],writable:false,enumerable:true,configurable:true};}
-   if(typeof k==='string'&&t.namedItem){
-    var n=t.namedItem(k);
-    if(n)return {value:n,writable:false,enumerable:false,configurable:true};}
-   return Reflect.getOwnPropertyDescriptor(t,k);}});}
+ return NV.__vitaLiveCollection(proto||HTMLCollection.prototype,items,!!shapeOnly);}
+/* the names a collection's items give it, for a listing of its keys:
+   each id, and the name of the tags that answer to one, once and in
+   order, leaving out any that is an index */
+NV.__vitaCollectionNames=function(a){
+ var out=[],seen=Object.create(null),i,n;
+ for(i=0;i<a.length;i++){
+  if(!a[i].getAttribute)continue;
+  n=a[i].getAttribute('id');
+  if(n&&!seen[n]&&indexKey(n)<0){seen[n]=1;out.push(n);}
+  if(NAMED_TAGS.indexOf(' '+a[i].tagName+' ')>=0){
+   n=a[i].getAttribute('name');
+   if(n&&!seen[n]&&indexKey(n)<0){seen[n]=1;out.push(n);}}}
+ return out;};
 /* A NodeList holds anything, answers to no name, and has the iteration
    helpers a collection does not. */
 function NodeList(){throw new TypeError('Illegal constructor');}

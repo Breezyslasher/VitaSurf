@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- Reading a live collection by index, as jQuery's cleanData and merge
+     do over getElementsByTagName('*'): 6000 elements, ?n= passes of
+     [i] until undefined, and of a length loop. -->
+<html><body><div id="r"></div><script>
+var n = +(/[?&]n=(\d+)/.exec(location.search) || [0, 5])[1];
+var r = document.getElementById('r'), h = '';
+for (var i = 0; i < 3000; i++) h += '<span class="a"><b>x</b></span>';
+r.innerHTML = h;
+var c = document.getElementsByTagName('*'), t0 = performance.now(), k, e, m = 0;
+for (k = 0; k < n; k++) for (i = 0; (e = c[i]) !== undefined; i++) m++;
+var t1 = performance.now();
+for (k = 0; k < n; k++) for (i = 0; i < c.length; i++) m += c[i] ? 1 : 0;
+var t2 = performance.now();
+console.log('collection-reads: ' + m + ' reads; [i] until undefined ' + (t1 - t0).toFixed(1) +
+ ' ms, a length loop ' + (t2 - t1).toFixed(1) + ' ms');
+</script></body></html>
