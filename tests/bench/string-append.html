@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<!--
+  A string built a character at a time (VitaSurf, patch 0496), as
+  YouTube makes its random strings: p += X.charAt(...), p += X[i] and
+  p = p + X[i] each made a new string at every step, since the stack's
+  reference kept the in-place append from applying. 20,000 strings of
+  16 characters natively: charAt 30 ms to 20 ms, an index 25 ms to 14 ms,
+  a constant 18 ms to 10 ms.
+-->
+<html><head><meta charset="utf-8"><title>string append</title></head>
+<body><script>
+(function () {
+  var A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", t, p, i, j, s = 0, r = [];
+  t = performance.now(); for (i = 0; i < 20000; i++) { p = ""; for (j = 0; j < 16; j++) p += "a"; s += p.length; } r.push("constant " + (performance.now() - t).toFixed(1));
+  t = performance.now(); for (i = 0; i < 20000; i++) { p = ""; for (j = 0; j < 16; j++) p += A.charAt(j); s += p.length; } r.push("charAt " + (performance.now() - t).toFixed(1));
+  t = performance.now(); for (i = 0; i < 20000; i++) { p = ""; for (j = 0; j < 16; j++) p += A[j]; s += p.length; } r.push("index " + (performance.now() - t).toFixed(1));
+  t = performance.now(); for (i = 0; i < 20000; i++) { p = ""; for (j = 0; j < 16; j++) p = p + A[j]; s += p.length; } r.push("p = p + " + (performance.now() - t).toFixed(1));
+  t = performance.now(); for (i = 0; i < 20000; i++) { p = ""; for (j = 0; j < 16; j++) p += A.charAt(Math.floor(Math.random() * A.length)); s += p.length; } r.push("random " + (performance.now() - t).toFixed(1));
+  console.log("string-append: " + r.join(" ms, ") + " ms (" + s + ")");
+})();
+</script></body></html>

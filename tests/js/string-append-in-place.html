@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Strings appended to in place</title></head>
+<body><pre id="out"></pre>
+<script>
+/* s += t and s = s + t put t on the end of s's own string when the
+   variable s was read from, and the stack, are all that hold it, and the
+   sum goes back into that variable (VitaSurf, patch 0496). Each string
+   must still be its own value: a copy, a key, a Map key, a closure's
+   variable, an argument, a symbol's description and the rest keep the
+   text they had. And s += o reads s before o's valueOf runs, as the
+   specification has it. Each line must say PASS; the expected answers
+   are Chrome's and Node's. */
+var R = [];
+function T(n, v) { R.push(n + ': ' + v); }
+function ch(i) { return 'abcdefghij'.charAt(i % 10); }
+(function () {
+  var s = 'ab', t = s; s += ch(2); T('a copy keeps its text', t + ' ' + s);
+  var u = 'x'; for (var i = 0; i < 40; i++) u += ch(i); var v = u; u += ch(1); u = u + ch(2);
+  T('one taken in the middle of a loop', v.length + ' ' + u.length + ' ' + v.slice(-3) + ' ' + u.slice(-3));
+  var o = {}, k = 'key'; k += ch(0); o[k] = 1; k += ch(1); o[k] = 2;
+  T('a key made then appended to', JSON.stringify(o) + ' ' + o.keya + ' ' + o.keyab + ' ' + ('keya' in o));
+  var m = new Map(), q = 'm'; q += ch(3); m.set(q, 1); var q0 = q; q += ch(4);
+  T('a Map key', m.get('md') + ' ' + m.get(q0) + ' ' + m.has('mde') + ' ' + q);
+  var arr = [], w = 'w'; for (i = 0; i < 5; i++) { w += ch(i); arr.push(w); }
+  T('each pushed one stays', arr.join(','));
+  var wide = 'é€'; var wide0 = wide; for (i = 0; i < 20; i++) wide += String.fromCharCode(0x400 + i);
+  wide += ch(1); T('wide characters', wide0 + ' ' + wide.length + ' ' + wide.charCodeAt(22) + ' ' + wide.slice(-2));
+  var mix = 'a'; mix += ch(1); mix += '€'; mix += ch(2); T('narrow then wide', mix);
+  var y = 'y', z; z = (y = y + ch(5)); var z2 = y; y = y + ch(6); T('a set and a store', z + ' ' + z2 + ' ' + y);
+  var cnt = 'c', obj = { valueOf: function () { cnt = 'changed'; return '!'; } }; cnt = cnt + obj;
+  T('valueOf that writes the variable', cnt);
+  var cnt2 = 'c', obj2 = { toString: function () { return 'T'; }, valueOf: undefined }; cnt2 += obj2; T('toString', cnt2);
+  var n = 'n'; n = n + 5; n += ch(1); n = n + null; T('other types', n);
+  var big = ''; for (i = 0; i < 3000; i++) big = big + ch(i); var big0 = big; big += 'Z';
+  T('long', big0.length + ' ' + big.length + ' ' + big.slice(2995) + ' ' + big0.slice(2995));
+})();
+function argf(a, b) { var keep = a; a = a + b; a += ch(7); arguments[0] = arguments[0] + 'A'; return keep + ' ' + a; }
+T('an argument', argf('p' + ch(0), ch(1)));
+function argsloppy(a) { var x = arguments; a = a + ch(1); return x[0] + ' ' + a; }
+T('an argument with arguments', argsloppy('q' + ch(0)));
+(function () {
+  var c = 'v'; c += ch(0); function get() { return c; } var before = get(); c = c + ch(1); c += ch(2);
+  T('a closure\'s variable', before + ' ' + get() + ' ' + c);
+  var fs = []; for (let i = 0; i < 3; i++) { let s = 'L' + i; s = s + ch(i); fs.push(function () { return s; }); s += '.'; }
+  T('let in a loop', fs.map(function (f) { return f(); }).join(','));
+  var g = 'g'; g += ch(0); var sym = Symbol(g); g += ch(1); T('a symbol\'s description', sym.description + ' ' + g);
+  var re = 'r'; re += ch(0); var rx = new RegExp(re); re += ch(1); T('a RegExp source', rx.source + ' ' + re);
+  var j1 = 'j'; j1 += ch(0); var parsed = JSON.parse('{"' + j1 + '":1}'); j1 += ch(1); T('JSON', Object.keys(parsed)[0] + ' ' + j1);
+  var sw = 'S'; sw += ch(0); var t2 = sw; switch (t2) { case 'Sa': sw += ch(1); } T('switch', t2 + ' ' + sw);
+})();
+var hsh = 0, all = R.join('\n'); for (var i = 0; i < all.length; i++) hsh = (hsh * 31 + all.charCodeAt(i)) | 0;
+R.push('all ' + all.length + ' ' + hsh);
+var WANT = [
+"a copy keeps its text: ab abc",
+"one taken in the middle of a loop: 41 43 hij jbc",
+"a key made then appended to: {\"keya\":1,\"keyab\":2} 1 2 true",
+"a Map key: 1 1 false mde",
+"each pushed one stays: wa,wab,wabc,wabcd,wabcde",
+"wide characters: é€ 23 98 Гb",
+"narrow then wide: ab€c",
+"a set and a store: yf yf yfg",
+"valueOf that writes the variable: c!",
+"toString: cT",
+"other types: n5bnull",
+"long: 3000 3001 fghijZ fghij",
+"an argument: pa pabhA",
+"an argument with arguments: qab qab",
+"a closure's variable: va vabc vabc",
+"let in a loop: L0a.,L1b.,L2c.",
+"a symbol's description: ga gab",
+"a RegExp source: ra rab",
+"JSON: ja jab",
+"switch: Sa Sab",
+"all 597 -1461452458"
+];
+var o = document.getElementById('out');
+R.forEach(function (l, i) {
+  var line = (l === WANT[i] ? 'PASS ' : 'FAIL ') + l + (l === WANT[i] ? '' : ' (want ' + WANT[i] + ')');
+  o.textContent += line + '\n';
+  console.log('string-append: ' + line);
+});
+console.log('string-append: done');
+</script>
+</body></html>

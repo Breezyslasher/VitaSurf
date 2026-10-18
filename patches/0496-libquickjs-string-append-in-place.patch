@@ -1,0 +1,161 @@
+diff --git a/quickjs.c b/quickjs.c
+index 968d80e..bcb66d6 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -5360,6 +5360,47 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
+     return ret;
+ }
+ 
++/*
++ * Appends op2 to op1 in place when op1's string can take it, as
++ * JS_ConcatString2 does, for a caller that knows the refs references
++ * to it are all ones the result replaces (VitaSurf): a flat, short
++ * string, not an atom, with room in its block. Nothing is freed; false
++ * leaves both as they were.
++ */
++static bool js_concat_in_place(JSContext *ctx, JSValueConst op1,
++                               JSValueConst op2, int refs)
++{
++    JSString *p1, *p2;
++
++    if (JS_VALUE_GET_TAG(op1) != JS_TAG_STRING ||
++        JS_VALUE_GET_TAG(op2) != JS_TAG_STRING)
++        return false;
++    p1 = JS_VALUE_GET_STRING(op1);
++    p2 = JS_VALUE_GET_STRING(op2);
++    if (p1->header.ref_count != refs || p1->atom_type != 0 ||
++        p1->kind != JS_STRING_KIND_NORMAL ||
++        p1->is_wide_char != p2->is_wide_char ||
++        p1->len > JS_STRING_ROPE_SHORT2_LEN ||
++        p2->len > JS_STRING_ROPE_SHORT_LEN ||
++        js_malloc_usable_size(ctx, p1) < sizeof(*p1) +
++        ((p1->len + p2->len) << p2->is_wide_char) + 1 - p1->is_wide_char)
++        return false;
++    if (p1->hash_next) {
++        /* its cached atom is for what it held before */
++        JS_FreeAtomRT(ctx->rt, p1->hash_next);
++        p1->hash_next = 0;
++    }
++    if (p1->is_wide_char) {
++        memcpy(str16(p1) + p1->len, str16(p2), p2->len << 1);
++        p1->len += p2->len;
++    } else {
++        memcpy(str8(p1) + p1->len, str8(p2), p2->len);
++        p1->len += p2->len;
++        str8(p1)[p1->len] = '\0';
++    }
++    return true;
++}
++
+ /* op1 and op2 are converted to strings. For convenience, op1 or op2 =
+    JS_EXCEPTION are accepted and return JS_EXCEPTION.  */
+ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
+@@ -18047,6 +18088,45 @@ void js_free_value_inl(JSContext *ctx, JSValue v)
+ }
+ #define JS_FreeValue(ctx, v) js_free_value_inl(ctx, v)
+ 
++/*
++ * Whether the instruction at pc stores the top of the stack, without
++ * reading it, in a variable that now holds v (VitaSurf): OP_add's
++ * in-place append.
++ */
++static inline bool js_add_stores_over(const uint8_t *pc, JSValue *var_buf,
++                                      JSValue *arg_buf, JSVarRef **var_refs,
++                                      JSValueConst v)
++{
++    JSValue *slot;
++
++    switch (pc[0]) {
++    case OP_put_loc: case OP_set_loc: case OP_put_loc_check:
++        slot = &var_buf[get_u16(pc + 1)]; break;
++    case OP_put_loc8: case OP_set_loc8:
++        slot = &var_buf[pc[1]]; break;
++    case OP_put_loc0: case OP_set_loc0: slot = &var_buf[0]; break;
++    case OP_put_loc1: case OP_set_loc1: slot = &var_buf[1]; break;
++    case OP_put_loc2: case OP_set_loc2: slot = &var_buf[2]; break;
++    case OP_put_loc3: case OP_set_loc3: slot = &var_buf[3]; break;
++    case OP_put_arg: case OP_set_arg:
++        slot = &arg_buf[get_u16(pc + 1)]; break;
++    case OP_put_arg0: case OP_set_arg0: slot = &arg_buf[0]; break;
++    case OP_put_arg1: case OP_set_arg1: slot = &arg_buf[1]; break;
++    case OP_put_arg2: case OP_set_arg2: slot = &arg_buf[2]; break;
++    case OP_put_arg3: case OP_set_arg3: slot = &arg_buf[3]; break;
++    case OP_put_var_ref: case OP_set_var_ref:
++        slot = var_refs[get_u16(pc + 1)]->pvalue; break;
++    case OP_put_var_ref0: case OP_set_var_ref0: slot = var_refs[0]->pvalue; break;
++    case OP_put_var_ref1: case OP_set_var_ref1: slot = var_refs[1]->pvalue; break;
++    case OP_put_var_ref2: case OP_set_var_ref2: slot = var_refs[2]->pvalue; break;
++    case OP_put_var_ref3: case OP_set_var_ref3: slot = var_refs[3]->pvalue; break;
++    default:
++        return false;
++    }
++    return JS_VALUE_GET_TAG(*slot) == JS_VALUE_GET_TAG(v) &&
++        JS_VALUE_GET_PTR(*slot) == JS_VALUE_GET_PTR(v);
++}
++
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+@@ -20065,6 +20145,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                         JS_VALUE_GET_FLOAT64(op2));
+                     JS_X87_FPCW_RESTORE(fpcw);
+                     sp--;
++                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&
++                           JS_VALUE_GET_TAG(op2) == JS_TAG_STRING &&
++                           JS_VALUE_GET_STRING(op1)->header.ref_count == 2 &&
++                           js_add_stores_over(pc, var_buf, arg_buf,
++                                              var_refs, op1) &&
++                           js_concat_in_place(ctx, op1, op2, 2)) {
++                    /*
++                     * s = s + t, and s += t with t not a constant or a
++                     * variable (VitaSurf): when the next instruction
++                     * stores the sum in the variable s was read from,
++                     * and that and the stack are all that hold it, t
++                     * goes on the end of s in place. A page building
++                     * a string a character at a time
++                     * (p += X.charAt(...)) had a new string made at
++                     * every step: YouTube's random strings, 36% of its
++                     * profile after load in build 787's log.
++                     */
++                    JS_FreeValue(ctx, op2);
++                    sp--;
+                 } else {
+                     sf->cur_pc = pc;
+                     if (js_add_slow(ctx, sp))
+@@ -20090,7 +20189,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     else
+                         *pv = js_int32(r);
+                     sp--;
+-                } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
++                } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING &&
++                           JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT) {
+                     JSValue op1;
+                     op1 = sp[-1];
+                     sp--;
+@@ -20098,6 +20198,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
+                     if (JS_IsException(op1))
+                         goto exception;
++                    /* s += t with s the only holder of its string
++                       goes on the end of it where it has room
++                       (VitaSurf): the reference taken below made the
++                       in-place append in JS_ConcatString2 never apply */
++                    if (js_concat_in_place(ctx, *pv, op1, 1)) {
++                        JS_FreeValue(ctx, op1);
++                        BREAK;
++                    }
+                     op1 = JS_ConcatString(ctx, js_dup(*pv), op1);
+                     if (JS_IsException(op1))
+                         goto exception;
+@@ -20105,7 +20213,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 } else {
+                     JSValue ops[2];
+                     /* In case of exception, js_add_slow frees ops[0]
+-                       and ops[1], so we must duplicate *pv */
++                       and ops[1], so we must duplicate *pv. An object
++                       comes here with a string too (VitaSurf): its
++                       valueOf may write the variable, which s += o
++                       reads first, and the string path read it after */
+                     sf->cur_pc = pc;
+                     ops[0] = js_dup(*pv);
+                     ops[1] = sp[-1];
