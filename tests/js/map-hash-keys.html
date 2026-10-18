@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Map and Set keys</title></head>
+<body><pre id="out"></pre>
+<script>
+/* A Map, Set, WeakMap or WeakSet finds its keys by a hash whose bits are
+   mixed (VitaSurf, patch 0498): an object's address and a number's
+   double had been multiplied by an odd number, which left their low zero
+   bits in place, so objects used one bucket in sixteen and every small
+   integer the same one. Keys must still be found as SameValueZero says:
+   -0 as 0, NaN as NaN, 5 as 5.0, a BigInt apart from a number, and the
+   order of insertion kept. Each line must say PASS; the expected answers
+   are Chrome's and Node's. */
+var R = [];
+function T(n, v) { R.push(n + ': ' + v); }
+var m = new Map();
+m.set(0, 'zero'); T('-0 finds 0', m.get(-0) + ' ' + m.has(-0));
+m.set(-0, 'negzero'); T('-0 is 0', m.size + ' ' + m.get(0) + ' ' + Object.is([...m.keys()][0], 0));
+m.set(NaN, 'nan'); T('NaN finds NaN', m.get(NaN) + ' ' + m.get(0 / 0) + ' ' + m.has(Number('x')));
+m.set(5, 'five'); T('5 and 5.0 and 10/2', m.get(5.0) + ' ' + m.get(10 / 2) + ' ' + m.get(4.5 + 0.5));
+m.set(2 ** 31, 'big'); T('2^31 as int and double', m.get(2147483648) + ' ' + m.get(2 ** 30 * 2));
+m.set(0.1 + 0.2, 'sum'); T('a double', m.get(0.30000000000000004) + ' ' + m.get(0.3));
+m.set(10n, 'bigint'); T('a BigInt', m.get(10n) + ' ' + m.get(10) + ' ' + m.get(BigInt(10)));
+m.set(2n ** 70n, 'huge'); T('a large BigInt', m.get(2n ** 70n) + ' ' + m.get(2n ** 71n / 2n));
+m.set('5', 'str'); T('a string is not a number', m.get('5') + ' ' + m.get(5));
+var s1 = Symbol('a'), s2 = Symbol('a'); m.set(s1, 'sym'); T('symbols', m.get(s1) + ' ' + m.get(s2));
+m.set(true, 'T'); m.set(1, 'one'); T('true and 1', m.get(true) + ' ' + m.get(1));
+m.set(null, 'N'); m.set(undefined, 'U'); T('null and undefined', m.get(null) + ' ' + m.get(undefined) + ' ' + m.get());
+var objs = []; for (var i = 0; i < 5000; i++) objs.push({ i: i });
+var om = new Map(); objs.forEach(function (o, i) { om.set(o, i); });
+var ok = 0; objs.forEach(function (o, i) { if (om.get(o) === i) ok++; }); T('5000 objects', ok + ' ' + om.get({ i: 1 }));
+for (i = 0; i < 5000; i += 2) om.delete(objs[i]); T('after deleting half', om.size + ' ' + om.has(objs[0]) + ' ' + om.get(objs[1]));
+var im = new Map(); for (i = -3000; i < 3000; i++) im.set(i, i * 2); ok = 0; for (i = -3000; i < 3000; i++) if (im.get(i) === i * 2) ok++;
+T('6000 integers', ok + ' ' + im.get(3000) + ' ' + im.get(-3000));
+var order = new Map([[3, 'c'], [1, 'a'], [2, 'b'], [{}, 'o'], ['x', 'x']]); order.delete(1); order.set(1, 'a2');
+T('insertion order', [...order.values()].join(','));
+var st = new Set([1, 1.0, -0, 0, NaN, NaN, '1', 1n]); T('a Set', st.size + ' ' + [...st].map(String).join(','));
+var wm = new WeakMap(), keys = []; for (i = 0; i < 3000; i++) { var k = {}; keys.push(k); wm.set(k, i); }
+ok = 0; for (i = 0; i < 3000; i++) if (wm.get(keys[i]) === i) ok++; T('a WeakMap', ok + ' ' + wm.has({}));
+var ws = new WeakSet(keys.slice(0, 100)); T('a WeakSet', ws.has(keys[5]) + ' ' + ws.has(keys[500]));
+var fm = new Map(); for (i = 0; i < 2000; i++) fm.set(i / 8, i); ok = 0; for (i = 0; i < 2000; i++) if (fm.get(i / 8) === i) ok++; T('2000 fractions', ok);
+var gm = Map.groupBy([1, 2, 3, 4, 5, 6], function (x) { return x % 3; }); T('groupBy', [...gm.keys()].join(',') + ' ' + gm.get(0).join(','));
+var WANT = [
+"-0 finds 0: zero true",
+"-0 is 0: 1 negzero true",
+"NaN finds NaN: nan nan true",
+"5 and 5.0 and 10/2: five five five",
+"2^31 as int and double: big big",
+"a double: sum undefined",
+"a BigInt: bigint undefined bigint",
+"a large BigInt: huge huge",
+"a string is not a number: str five",
+"symbols: sym undefined",
+"true and 1: T one",
+"null and undefined: N U U",
+"5000 objects: 5000 undefined",
+"after deleting half: 2500 false 1",
+"6000 integers: 6000 undefined -6000",
+"insertion order: c,b,o,x,a2",
+"a Set: 5 1,0,NaN,1,1",
+"a WeakMap: 3000 false",
+"a WeakSet: true false",
+"2000 fractions: 2000",
+"groupBy: 1,2,0 3,6"
+];
+var o = document.getElementById('out');
+R.forEach(function (l, i) {
+  var line = (l === WANT[i] ? 'PASS ' : 'FAIL ') + l + (l === WANT[i] ? '' : ' (want ' + WANT[i] + ')');
+  o.textContent += line + '\n';
+  console.log('map-keys: ' + line);
+});
+console.log('map-keys: done');
+</script>
+</body></html>

@@ -1,0 +1,49 @@
+diff --git a/quickjs.c b/quickjs.c
+index bcb66d6..f60c0b0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -55379,6 +55379,26 @@ static JSValueConst map_normalize_key_const(JSContext *ctx, JSValueConst key)
+ }
+ 
+ /* XXX: better hash ? */
++/*
++ * The bits of a pointer or a double, mixed so that every bit of the
++ * value reaches the low bits a table of a power of two takes (VitaSurf,
++ * the finaliser of MurmurHash3). The key had been multiplied by an odd
++ * number, which keeps its low zero bits where they are: an object's
++ * address, 16-byte aligned, used one bucket in sixteen, and a small
++ * integer, a double whose low 32 bits are all zero, hashed to a multiple
++ * of 2^18, so every integer key of a Map went into the same bucket and
++ * each lookup compared it with all of them.
++ */
++static inline uint32_t map_hash_mix(uint64_t x)
++{
++    x ^= x >> 33;
++    x *= 0xff51afd7ed558ccdULL;
++    x ^= x >> 33;
++    x *= 0xc4ceb9fe1a85ec53ULL;
++    x ^= x >> 33;
++    return (uint32_t)x;
++}
++
+ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
+ {
+     uint32_t tag = JS_VALUE_GET_NORM_TAG(key);
+@@ -55399,7 +55419,7 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
+         break;
+     case JS_TAG_OBJECT:
+     case JS_TAG_SYMBOL:
+-        h = (uintptr_t)JS_VALUE_GET_PTR(key) * 3163;
++        h = map_hash_mix((uintptr_t)JS_VALUE_GET_PTR(key));
+         break;
+     case JS_TAG_INT:
+         d = JS_VALUE_GET_INT(key);
+@@ -55418,7 +55438,7 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
+             d = NAN;
+     hash_float64:
+         u.d = d;
+-        h = (u.u32[0] ^ u.u32[1]) * 3163;
++        h = map_hash_mix(u.u64);
+         return h ^= JS_TAG_FLOAT64;
+     default:
+         h = 0;

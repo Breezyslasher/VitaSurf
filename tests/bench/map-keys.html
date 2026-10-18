@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<!--
+  Map and Set with many keys (VitaSurf, patch 0498): 100,000 keys set and
+  then got, natively. Every small integer key had gone into one bucket of
+  the hash table, and objects into one bucket in sixteen: integers
+  250 ms to 40 ms, doubles 220 ms to 35 ms, objects 200 ms to 55-75 ms;
+  strings, hashed by their text, are as they were.
+-->
+<html><head><meta charset="utf-8"><title>map keys</title></head>
+<body><script>
+(function () {
+  var N = 100000, i, t, m, r = [], a = [];
+  for (i = 0; i < N; i++) a.push({});
+  t = performance.now(); m = new Map(); for (i = 0; i < N; i++) m.set(i, i); for (i = 0; i < N; i++) m.get(i); r.push("integers " + (performance.now() - t).toFixed(1));
+  t = performance.now(); m = new Map(); for (i = 0; i < N; i++) m.set(i * 0.5, i); for (i = 0; i < N; i++) m.get(i * 0.5); r.push("doubles " + (performance.now() - t).toFixed(1));
+  t = performance.now(); m = new Map(); for (i = 0; i < N; i++) m.set("k" + i, i); for (i = 0; i < N; i++) m.get("k" + i); r.push("strings " + (performance.now() - t).toFixed(1));
+  t = performance.now(); m = new Map(); for (i = 0; i < N; i++) m.set(a[i], i); for (i = 0; i < N; i++) m.get(a[i]); r.push("objects " + (performance.now() - t).toFixed(1));
+  t = performance.now(); var w = new WeakMap(); for (i = 0; i < N; i++) w.set(a[i], i); for (i = 0; i < N; i++) w.get(a[i]); r.push("WeakMap " + (performance.now() - t).toFixed(1));
+  console.log("map-keys: " + r.join(" ms, ") + " ms");
+})();
+</script></body></html>
