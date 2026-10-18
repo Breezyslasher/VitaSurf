@@ -1,0 +1,122 @@
+diff --git a/include/dom/core/element.h b/include/dom/core/element.h
+index e84f36c..cde10c0 100644
+--- a/include/dom/core/element.h
++++ b/include/dom/core/element.h
+@@ -365,4 +365,14 @@ dom_exception dom_element_named_parent_node_cross(dom_element *element,
+ dom_exception dom_element_parent_node_cross(dom_element *element,
+ 		dom_element **parent);
+ 
++/*
++ * Whether an element's id is name, compared as dom_string_lwc_isequal
++ * does (VitaSurf): the id attribute found in the element's own list,
++ * where getting the id went through the HTML getAttribute, which looks
++ * up the element's namespace and lowers the name "id" for every test a
++ * selector makes, and handed back a reference to the value.
++ */
++dom_exception dom_element_vita_has_id(dom_element *element,
++		lwc_string *name, bool *match);
++
+ #endif
+diff --git a/src/core/element.c b/src/core/element.c
+index 2aa29e3..ac1857d 100644
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -2327,6 +2327,31 @@ dom_exception _dom_element_get_id(struct dom_element *ele, dom_string **id)
+ 
+ 
+ 
++/* exported interface documented in dom/core/element.h */
++dom_exception dom_element_vita_has_id(dom_element *element,
++		lwc_string *name, bool *match)
++{
++	dom_attr_list *a;
++	dom_string *idn, *value = NULL;
++	dom_exception err;
++
++	/* the attribute named id, as the HTML element's id reads it */
++	*match = false;
++	idn = _dom_document_get_id_name(dom_node_get_owner(element));
++	if (idn == NULL || element->attributes == NULL)
++		return DOM_NO_ERR;
++	a = _dom_element_attr_list_find_by_name(element->attributes, idn,
++			NULL);
++	if (a == NULL)
++		return DOM_NO_ERR;
++	err = dom_attr_get_value(a->attr, &value);
++	if (err != DOM_NO_ERR || value == NULL)
++		return err;
++	*match = dom_string_lwc_isequal(value, name);
++	dom_string_unref(value);
++	return DOM_NO_ERR;
++}
++
+ /*-------------- The dom_namednodemap functions -------------------------*/
+ 
+ /* Implementation function for NamedNodeMap, see core/namednodemap.h for 
+diff --git a/src/html/html_element.c b/src/html/html_element.c
+index d4d3917..c276518 100644
+--- a/src/html/html_element.c
++++ b/src/html/html_element.c
+@@ -202,6 +202,26 @@ static bool html_element_folds_case(struct dom_element *element)
+ }
+ 
+ 
++/*
++ * Whether a name has to be lowered before the element's attributes are
++ * searched (VitaSurf): never when it has no ASCII capital, which is what
++ * nearly every name is, so the namespace an element folds by is looked
++ * up only for a name that would change. Every getAttribute, and every
++ * attribute and id test a selector makes, had looked it up and then
++ * read the name again for a capital.
++ */
++static bool html_name_folds(struct dom_element *element, dom_string *name)
++{
++	const char *d = dom_string_data(name);
++	size_t len = dom_string_byte_length(name), i;
++
++	for (i = 0; i < len; i++) {
++		if (d[i] >= 'A' && d[i] <= 'Z')
++			return html_element_folds_case(element);
++	}
++	return false;
++}
++
+ dom_exception _dom_html_element_get_attribute(
+ 		struct dom_element *element,
+ 		dom_string *name, dom_string **value)
+@@ -209,7 +229,7 @@ dom_exception _dom_html_element_get_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
+-	if (html_element_folds_case(element) == false) {
++	if (html_name_folds(element, name) == false) {
+ 		return _dom_element_get_attribute(element, name, value);
+ 	}
+ 
+@@ -231,7 +251,7 @@ dom_exception _dom_html_element_set_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
+-	if (html_element_folds_case(element) == false) {
++	if (html_name_folds(element, name) == false) {
+ 		return _dom_element_set_attribute(element, name, value);
+ 	}
+ 
+@@ -253,7 +273,7 @@ dom_exception _dom_html_element_remove_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
+-	if (html_element_folds_case(element) == false) {
++	if (html_name_folds(element, name) == false) {
+ 		return _dom_element_remove_attribute(element, name);
+ 	}
+ 
+@@ -275,7 +295,7 @@ dom_exception _dom_html_element_has_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
+-	if (html_element_folds_case(element) == false) {
++	if (html_name_folds(element, name) == false) {
+ 		return _dom_element_has_attribute(element, name, result);
+ 	}
+ 

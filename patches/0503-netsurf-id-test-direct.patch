@@ -1,0 +1,32 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 7270ac6c8..bf3ee64e4 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -1313,22 +1313,11 @@ css_error node_has_class(void *pw, void *node,
+ css_error node_has_id(void *pw, void *node,
+ 		lwc_string *name, bool *match)
+ {
+-	dom_node *n = node;
+-	dom_string *attr;
+-	dom_exception err;
+-
+-	*match = false;
+-
+-	/** \todo Assumes an HTML DOM */
+-	err = dom_html_element_get_id(n, &attr);
+-	if (err != DOM_NO_ERR)
+-		return CSS_OK;
+-
+-	if (attr != NULL) {
+-		*match = dom_string_lwc_isequal(attr, name);
+-
+-		dom_string_unref(attr);
+-	}
++	/* the id attribute read from the element's own list, not through
++	 * the HTML getAttribute (VitaSurf) */
++	if (dom_element_vita_has_id((dom_element *) node, name, match) !=
++			DOM_NO_ERR)
++		*match = false;
+ 
+ 	return CSS_OK;
+ }
