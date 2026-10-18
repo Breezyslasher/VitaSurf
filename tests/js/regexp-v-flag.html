@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>RegExp v flag</title></head>
+<body><pre id="out"></pre>
+<script>
+/* The v flag (VitaSurf, patch 0500): Unicode-aware as u is, with class
+   set expressions (nested classes, && and --, \q{...}), the properties of
+   strings (\p{RGI_Emoji} and the rest, Unicode 17), folding under i before
+   a complement, and the syntax errors ES2024 gives. Each line must say
+   PASS; the expected answers are Chrome's and Node's (no sequence new in
+   Unicode 17 is used, as Node 22 has Unicode 16). */
+var R = [];
+function T(n, f) { var v; try { v = f(); } catch (e) { v = e.name; } R.push(n + ': ' + (typeof v === 'string' ? v : JSON.stringify(v))); }
+function all(re, s) { return (s.match(re) || []).join('|'); }
+T('dot is a code point', function () { return /^.$/v.test('\u{1F600}'); });
+T('a class of an astral character', function () { return /^[\u{1F600}]$/v.test('\u{1F600}'); });
+T('lastIndex past a pair', function () { var r = /./gv; r.exec('\u{1F600}x'); return r.lastIndex; });
+T('split by code point', function () { return '\u{1F600}\u{1F601}'.split(/(?:)/v).length; });
+T('replace by code point', function () { return '\u{20BB7}a\u{20BB7}'.replace(/(?:)/gv, '-'); });
+T('matchAll by code point', function () { return [...'\u{20BB7}\u{20BB7}'.matchAll(/(?:)/gv)].map(function (m) { return m.index; }).join(','); });
+T('difference', function () { return all(/[\w--\d]/gv, 'a1b2_'); });
+T('intersection', function () { return all(/[\p{L}&&\p{Script=Greek}]/gv, 'aβcδ'); });
+T('nested classes', function () { return all(/[[a-z]--[aeiou]]/gv, 'education'); });
+T('nested negation', function () { return all(/[[^a-z]&&\w]/gv, 'aB3_c'); });
+T('three-way difference', function () { return all(/[[a-z]--b--c]/gv, 'abcd'); });
+T('a range in a difference', function () { return new RegExp('[a-z--b]', 'v'); });
+T('string literal', function () { return all(/[\q{abc|d}x]/gv, 'abcdxab'); });
+T('longest string first', function () { return all(/[\q{a|ab|abc}]/gv, 'abcab'); });
+T('empty string', function () { return /^[\q{}]$/v.test(''); });
+T('a string quantified', function () { return all(/[\q{ab}]+/gv, 'ababxab'); });
+T('a string backtracked', function () { return /^[\q{abc|ab}]c$/v.test('abc'); });
+T('strings in a lookbehind', function () { return all(/(?<=[\q{ab|xyz}])!/gv, 'ab!xyz!c!'); });
+T('emoji keycap', function () { return /^\p{Emoji_Keycap_Sequence}$/v.test('#️⃣'); });
+T('a flag', function () { return /^\p{RGI_Emoji_Flag_Sequence}$/v.test('\u{1F1EF}\u{1F1F5}'); });
+T('RGI_Emoji, a modifier sequence', function () { return /^\p{RGI_Emoji}$/v.test('\u{1F44D}\u{1F3FD}'); });
+T('RGI_Emoji, a ZWJ sequence', function () { return /^\p{RGI_Emoji}$/v.test('\u{1F468}‍\u{1F469}‍\u{1F467}'); });
+T('RGI_Emoji minus a string', function () { return /^[\p{RGI_Emoji}--\q{\u{1F1EF}\u{1F1F5}}]$/v.test('\u{1F1EF}\u{1F1F5}'); });
+T('RGI_Emoji in text', function () { return ('a\u{1F44D}\u{1F3FD}b❤️c'.match(/\p{RGI_Emoji}/gv) || []).map(function (s) { return [...s].length; }).join(','); });
+T('case folding of a string', function () { return /^[\q{AbC}]$/iv.test('aBc'); });
+T('kelvin sign', function () { return /[k]/iv.test('K'); });
+T('long s', function () { return /[s]/iv.test('ſ'); });
+T('folded before the complement', function () { return /[^k]/iv.test('K'); });
+T('\\W under i', function () { return /\W/iv.test('ſ'); });
+T('\\P under i', function () { return /\P{Lowercase_Letter}/iv.test('a'); });
+T('a property under i', function () { return /^\p{Lu}$/iv.test('a'); });
+T('unicodeSets', function () { return /a/v.unicodeSets + ' ' + /a/v.flags; });
+T('u and v together', function () { return new RegExp('a', 'uv'); });
+T('a negated class with strings', function () { return new RegExp('[^\\q{ab}]', 'v'); });
+T('\\P of strings', function () { return new RegExp('\\P{RGI_Emoji}', 'v'); });
+T('a property of strings without v', function () { return new RegExp('\\p{RGI_Emoji}', 'u'); });
+T('a reserved double punctuator', function () { return new RegExp('[a!!b]', 'v'); });
+T('mixed operators', function () { return new RegExp('[a&&b--c]', 'v'); });
+T('a range in an intersection', function () { return new RegExp('[a-z&&b]', 'v'); });
+T('an unescaped (', function () { return new RegExp('[(]', 'v'); });
+T('an escaped (', function () { return /[\(]/v.test('('); });
+T('an escaped reserved punctuator', function () { return /[\&\-\!]/v.test('!'); });
+T('a single &', function () { return /[a&b]/v.test('&'); });
+T('&&&', function () { return new RegExp('[a&&&b]', 'v'); });
+T('[a-]', function () { return new RegExp('[a-]', 'v'); });
+T('backspace', function () { return /[\b]/v.test('\b'); });
+T('a control letter', function () { return /[\cJ]/v.test('\n'); });
+T('negated nested string class', function () { return new RegExp('[[^\\q{a}]]', 'v').test('b'); });
+T('negation of a one-character string', function () { return /[^\q{a|b}]/v.test('c'); });
+T('subtraction keeps strings maybe', function () { return new RegExp('[^\\q{ab}--\\q{ab}]', 'v'); });
+T('intersection of strings', function () { return all(/[\q{ab|cd|e}&&\q{cd|e|f}]/gv, 'abcdef'); });
+T('empty class', function () { return /[]/v.test('a') + ' ' + /[^]/v.test('a'); });
+T('sticky with a string class', function () { var r = /[\q{ab}]/vy; r.lastIndex = 2; return r.test('xxab'); });
+T('a capture after a string class', function () { return JSON.stringify(/([\q{ab|a}])(b?)/v.exec('ab').slice(1)); });
+var WANT = [
+"dot is a code point: true",
+"a class of an astral character: true",
+"lastIndex past a pair: 2",
+"split by code point: 2",
+"replace by code point: -𠮷-a-𠮷-",
+"matchAll by code point: 0,2,4",
+"difference: a|b|_",
+"intersection: β|δ",
+"nested classes: d|c|t|n",
+"nested negation: B|3|_",
+"three-way difference: a|d",
+"a range in a difference: SyntaxError",
+"string literal: abc|d|x",
+"longest string first: abc|ab",
+"empty string: true",
+"a string quantified: abab|ab",
+"a string backtracked: true",
+"strings in a lookbehind: !|!",
+"emoji keycap: true",
+"a flag: true",
+"RGI_Emoji, a modifier sequence: true",
+"RGI_Emoji, a ZWJ sequence: true",
+"RGI_Emoji minus a string: false",
+"RGI_Emoji in text: 2,2",
+"case folding of a string: true",
+"kelvin sign: true",
+"long s: true",
+"folded before the complement: false",
+"\\W under i: false",
+"\\P under i: false",
+"a property under i: true",
+"unicodeSets: true v",
+"u and v together: SyntaxError",
+"a negated class with strings: SyntaxError",
+"\\P of strings: SyntaxError",
+"a property of strings without v: SyntaxError",
+"a reserved double punctuator: SyntaxError",
+"mixed operators: SyntaxError",
+"a range in an intersection: SyntaxError",
+"an unescaped (: SyntaxError",
+"an escaped (: true",
+"an escaped reserved punctuator: true",
+"a single &: true",
+"&&&: SyntaxError",
+"[a-]: SyntaxError",
+"backspace: true",
+"a control letter: true",
+"negated nested string class: true",
+"negation of a one-character string: true",
+"subtraction keeps strings maybe: SyntaxError",
+"intersection of strings: cd|e",
+"empty class: false true",
+"sticky with a string class: true",
+"a capture after a string class: [\"ab\",\"\"]"
+];
+var o = document.getElementById('out');
+R.forEach(function (l, i) {
+  var line = (l === WANT[i] ? 'PASS ' : 'FAIL ') + l + (l === WANT[i] ? '' : ' (want ' + WANT[i] + ')');
+  o.textContent += line + '\n';
+  console.log('regexp-v: ' + line);
+});
+console.log('regexp-v: done');
+</script>
+</body></html>
