@@ -1,0 +1,139 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index b8cb34cba..b4d3a5bae 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -4805,6 +4805,79 @@ bool box_child_quiet(html_content *c, dom_node *e, dom_node *child)
+ 	return none;
+ }
+ 
++/* exported interface documented in html/box_construct.h */
++bool box_child_build(html_content *c, dom_node *e, dom_node *child,
++		enum box_restyle *result, dom_node **done, unsigned *n_done,
++		unsigned max_done)
++{
++	struct box_construct_props props;
++	const css_computed_style *root_style, *style;
++	css_select_results *fresh;
++	dom_node *parent = NULL;
++	dom_node_type type;
++	struct box *nb;
++	unsigned count = 0;
++	bool in, built;
++
++	if (c->layout == NULL || box_for_node(e) == NULL ||
++			nscss_children_ordered(e) ||
++			dom_node_get_node_type(child, &type) != DOM_NO_ERR ||
++			type != DOM_ELEMENT_NODE ||
++			box_for_node(child) != NULL ||
++			!show_hide_allowed(c) ||
++			c->base.textsearch.context != NULL)
++		return false;
++	if (dom_node_get_parent_node(child, &parent) != DOM_NO_ERR)
++		return false;
++	in = parent == e;
++	if (parent != NULL)
++		dom_node_unref(parent);
++	if (!in)
++		return false;
++
++	box_extract_properties(c, child, &props);
++	if (props.parent_style == NULL || props.node_is_root)
++		return false;
++	root_style = c->layout->style;
++	nscss_clear_node_data(child);
++	fresh = box_get_style(c, props.parent_style, root_style, child);
++	if (fresh == NULL)
++		return false;
++	box_note_neg_z(c, fresh);
++	style = fresh->styles[CSS_PSEUDO_ELEMENT_NONE];
++	if (style == NULL || ns_computed_display(style, false) ==
++			CSS_DISPLAY_NONE) {
++		css_select_results_destroy(fresh);
++		return false;
++	}
++	/* built as an element that has just been shown is: nothing is
++	 * changed when that cannot be done safely */
++	built = box_show_element(c, child, fresh);
++	css_select_results_destroy(fresh);
++	if (!built)
++		return false;
++	c->restyle_built = true;
++
++	nb = box_for_node(child);
++	if (nb == NULL) {
++		restyle_why = "new content that could not be built";
++		*result = BOX_RESTYLE_LAYOUT;
++		return true;
++	}
++	/* what was put in may count, which the rest of the page sees */
++	if (rebuild_results_count(nb->styles) || (nb->children != NULL &&
++			rebuild_subtree_counts(nb->children, &count))) {
++		restyle_why = "new content that counts or quotes";
++		*result = BOX_RESTYLE_LAYOUT;
++		return true;
++	}
++	/* changes inside it in the same batch need nothing more */
++	if (*n_done < max_done)
++		done[(*n_done)++] = dom_node_ref(child);
++	*result = BOX_RESTYLE_REFLOW;
++	return true;
++}
++
+ /* exported interface documented in html/box_construct.h */
+ enum box_restyle box_restyle(html_content *c, dom_node *n, bool subtree,
+ 		unsigned *budget)
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index 3a0c78829..5ff6791c6 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -194,6 +194,27 @@ enum box_restyle {
+ bool box_child_quiet(struct html_content *c, struct dom_node *e,
+ 		struct dom_node *child);
+ 
++/**
++ * Build the boxes of an element child put into an element, on their own,
++ * as an element just shown is built (VitaSurf): an element added to the
++ * body had the whole tree built again, the body's children having no
++ * block of their own to build. Not when a selector has asked about the
++ * order or presence of the element's children (nscss_children_ordered).
++ *
++ * \param c         the document
++ * \param e         the element whose children changed
++ * \param child     the child put in
++ * \param result    what the page needs, when it returns true
++ * \param done      the blocks built in this batch (box_rebuild_content);
++ *                  the child is added when there is room
++ * \param n_done    how many there are
++ * \param max_done  how many done can hold
++ * \return true if its boxes were built, false with nothing changed
++ */
++bool box_child_build(struct html_content *c, struct dom_node *e,
++		struct dom_node *child, enum box_restyle *result,
++		struct dom_node **done, unsigned *n_done, unsigned max_done);
++
+ /**
+  * Build again the boxes around a text node whose text a script changed,
+  * or an element whose children it changed: those of the nearest block
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 4778c22ac..261b32258 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -5245,6 +5245,18 @@ bool html_restyle_attrs(html_content *c,
+ 					frames = true;
+ 				continue;
+ 			}
++			/* an element put in, built on its own as one shown
++			 * is (VitaSurf) */
++			if (ch->child != NULL && box_child_build(c, ch->node,
++					ch->child, &r, built, &n_built,
++					sizeof(built) / sizeof(built[0]))) {
++				if (r > res)
++					res = r;
++				if (res == BOX_RESTYLE_LAYOUT)
++					ATTR_WHY("new content: %s",
++						 box_restyle_why());
++				continue;
++			}
+ 			/* new text, or new children: the boxes around */
+ 			r = box_rebuild_content(c, ch->node, built, &n_built,
+ 					sizeof(built) / sizeof(built[0]));

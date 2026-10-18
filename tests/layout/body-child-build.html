@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<!--
+  Elements put into the body after load are built on their own, as an
+  element just shown is (box_child_build, VitaSurf): the body's children
+  have no block of their own to build, and every block a script added to
+  the body had the whole page built again, 2.2 to 2.4 s each on cnn.com
+  in build 793's log. The log must not say "need the layout rebuilt"
+  for the first five steps; the later ones (an inline element, one that
+  counts, one before inline text) are still built the old way. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Body children built</title>
+<style>
+body { margin: 0; font: 16px/20px sans-serif; }
+.blk { height: 40px; }
+pre { margin: 0; }
+.ad { height: 30px; background: #ccc; }
+.abs { position: absolute; top: 500px; left: 10px; width: 50px; height: 50px; }
+.fx { display: flex; }
+.fx > * { width: 60px; height: 20px; }
+ol { counter-reset: n; }
+.cnt::before { counter-increment: n; content: counter(n); }
+</style></head>
+<body>
+<div class="blk" id="first">first</div>
+<div class="blk" id="second">second</div>
+<div class="fx" id="flex"><span id="f1">a</span></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('body-child-build: ' + l); }
+function $(id) { return document.getElementById(id); }
+function el(tag, attrs, text) { var e = document.createElement(tag); for (var k in attrs) e.setAttribute(k, attrs[k]); if (text) e.textContent = text; return e; }
+var steps = [
+  function () {
+    window.w0 = document.body.offsetWidth;
+    document.body.appendChild(el('div', { 'class': 'ad', id: 'end' }, 'appended'));
+  },
+  function () {
+    ok('an appended block goes after the others', $('end').offsetTop, $('out').offsetTop + $('out').offsetHeight);
+    document.body.insertBefore(el('div', { 'class': 'ad', id: 'mid' }, 'between'), $('second'));
+  },
+  function () {
+    ok('a block put before another goes there', $('mid').offsetTop, 40);
+    ok('and moves what follows it', $('second').offsetTop, 70);
+    var d = el('div', { id: 'deep' });
+    d.innerHTML = '<p style="margin:0;height:25px">para</p><div style="height:15px"><b>bold</b></div>';
+    document.body.insertBefore(d, $('second'));
+  },
+  function () {
+    ok('one with children is built with them', $('deep').offsetHeight, 40);
+    ok('the next one moves down by it', $('second').offsetTop, 110);
+    document.body.appendChild(el('div', { 'class': 'abs', id: 'abs' }));
+  },
+  function () {
+    ok('an absolutely placed one goes where it says', $('abs').offsetTop, 500);
+    ok('and moves nothing', $('second').offsetTop, 110);
+    $('flex').appendChild(el('i', { id: 'f2' }, 'b'));
+  },
+  function () {
+    ok('a flex item put in is laid out in its row', $('f2').offsetLeft, 60);
+    ok('the page kept its width', document.body.offsetWidth, window.w0);
+    document.body.insertBefore(el('span', { id: 'inl' }, 'inline'), $('first'));
+  },
+  function () {
+    ok('an inline one before the first block is drawn', $('inl').offsetWidth > 0, true);
+    var o = el('ol', { id: 'ol' });
+    o.innerHTML = '<li class="cnt">x</li>';
+    document.body.appendChild(o);
+  },
+  function () {
+    ok('a list that counts is drawn', $('ol').offsetHeight > 0, true);
+    $('out').textContent = out.join('\n');
+    console.log('body-child-build: done');
+  }
+];
+addEventListener('load', function () {
+  var i = 0;
+  (function next() {
+    steps[i++]();
+    if (i < steps.length)
+      setTimeout(next, 150);
+  })();
+});
+</script>
+</body></html>

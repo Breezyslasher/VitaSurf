@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- Blocks a script puts into the body after load, one a turn, as ad and
+     consent scripts do: each had the whole page built again, the body's
+     children having no block of their own to build. 3000 elements, ?n=
+     appends. -->
+<html><head><style>.c { padding: 2px; } .c span { color: #333; }</style></head><body>
+<div id="r"></div><script>
+var n = +(/[?&]n=(\d+)/.exec(location.search) || [0, 20])[1];
+var h = '';
+for (var i = 0; i < 1000; i++) h += '<div class="c"><span>item</span> <b>' + i + '</b></div>';
+document.getElementById('r').innerHTML = h;
+addEventListener('load', function () {
+ var k = 0, t0 = performance.now();
+ (function step() {
+  if (k++ < n) {
+   var d = document.createElement('div');
+   d.className = 'c'; d.textContent = 'added ' + k;
+   document.body.appendChild(d);
+   void document.body.offsetHeight;
+   setTimeout(step, 0);
+   return;
+  }
+  console.log('body-appends: ' + n + ' appends in ' + (performance.now() - t0).toFixed(1) + ' ms');
+ })();
+});
+</script></body></html>
