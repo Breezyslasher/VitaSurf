@@ -1,0 +1,433 @@
+diff --git a/content/handlers/html/box_textarea.c b/content/handlers/html/box_textarea.c
+index 5f082ac25..15c72ebc3 100644
+--- a/content/handlers/html/box_textarea.c
++++ b/content/handlers/html/box_textarea.c
+@@ -72,7 +72,7 @@ nserror box_textarea_keypress(html_content *html, struct box *box, uint32_t key)
+ 		 * button is clicked, or the form submitted with its
+ 		 * submit event (VitaSurf) */
+ 		if (form != NULL && form->node != NULL &&
+-		    html->jsthread != NULL) {
++		    html_script_realm(html)) {
+ 			struct form_control *fc;
+ 
+ 			for (fc = form->controls; fc != NULL; fc = fc->next) {
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index b1e9574d9..204ac06e4 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -327,6 +327,42 @@ static bool html_process_inserted_link(html_content *c, dom_node *node)
+ }
+ 
+ 
++/** Whether an element has an inline event handler, an on* attribute. */
++static bool element_has_handler(dom_node *node)
++{
++	dom_namednodemap *attrs = NULL;
++	uint32_t n = 0, i;
++	bool has = false, found = false;
++
++	if (dom_node_has_attributes(node, &has) != DOM_NO_ERR || !has ||
++	    dom_node_get_attributes(node, &attrs) != DOM_NO_ERR ||
++	    attrs == NULL) {
++		return false;
++	}
++	(void) dom_namednodemap_get_length(attrs, &n);
++	for (i = 0; i < n && !found; i++) {
++		dom_node *attr = NULL;
++		dom_string *name = NULL;
++
++		if (dom_namednodemap_item(attrs, i, &attr) != DOM_NO_ERR ||
++		    attr == NULL) {
++			continue;
++		}
++		if (dom_attr_get_name((dom_attr *) attr, &name) == DOM_NO_ERR &&
++		    name != NULL) {
++			const char *s = dom_string_data(name);
++
++			found = dom_string_byte_length(name) > 2 &&
++				(s[0] == 'o' || s[0] == 'O') &&
++				(s[1] == 'n' || s[1] == 'N');
++			dom_string_unref(name);
++		}
++		dom_node_unref(attr);
++	}
++	dom_namednodemap_unref(attrs);
++	return found;
++}
++
+ /* handler for a SCRIPT which has been added to a tree */
+ static void
+ dom_SCRIPT_showed_up(html_content *htmlc, dom_html_script_element *script)
+@@ -397,6 +433,10 @@ dom_SCRIPT_showed_up(html_content *htmlc, dom_html_script_element *script)
+ 		(void) dom_html_script_element_set_flags(script,
+ 			flags | DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED);
+ 	}
++	/* the page's first script makes its realm (VitaSurf) */
++	if (!html_script_realm(htmlc)) {
++		return;
++	}
+ 
+ 	res = html_process_script(htmlc, (dom_node *) script);
+ 	if (res == DOM_HUBBUB_OK) {
+@@ -747,18 +787,15 @@ static void html_process_inserted_element(html_content *htmlc,
+ 	}
+ 
+ 	if (htmlc->enable_scripting) {
+-		/* ensure javascript context is available */
+-		if (htmlc->jsthread == NULL) {
+-			union content_msg_data msg_data;
+-
+-			msg_data.jsthread = &htmlc->jsthread;
+-			content_broadcast(&htmlc->base,
+-					  CONTENT_MSG_GETTHREAD,
+-					  &msg_data);
+-			NSLOG(netsurf, INFO,
+-			      "javascript context: %p (htmlc: %p)",
+-			      htmlc->jsthread,
+-			      htmlc);
++		/* the page commits at its first element, and has a realm once
++		 * an inline handler needs one (VitaSurf) */
++		html_script_commit(htmlc);
++		/* a page's load waits for its frames, which its realm sees
++		 * to (js_fire_event), so a page with an iframe has one */
++		if (htmlc->jsthread == NULL &&
++		    (tag_type == DOM_HTML_ELEMENT_TYPE_IFRAME ||
++		     element_has_handler(node))) {
++			(void) html_script_realm(htmlc);
+ 		}
+ 		if (htmlc->jsthread != NULL) {
+ 			js_handle_new_element(htmlc->jsthread,
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 7571ff208..564df5dab 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -310,8 +310,11 @@ static void html_ready_deferred(void *p)
+ 		return;
+ 	}
+ 	content_set_ready(&c->base);
++	c->load_fired = true;
+ 	if (c->jsthread != NULL) {
+ 		js_fire_event(c->jsthread, "load", c->document, NULL);
++	} else {
++		js_loaded_without_realm(c);
+ 	}
+ 	html_proceed_to_done(c);
+ }
+@@ -414,8 +417,11 @@ static void html_box_convert_done(html_content *c, bool success)
+ 	 * timer it set, measured every element as 0 by 0 where a browser
+ 	 * gives the laid out size: tests/js/geometry.html.
+ 	 */
++	c->load_fired = true;
+ 	if (c->jsthread != NULL && !c->aborted) {
+ 		js_fire_event(c->jsthread, "load", c->document, NULL);
++	} else if (!c->aborted) {
++		js_loaded_without_realm(c);
+ 	}
+ 
+ 	html_proceed_to_done(c);
+@@ -1491,6 +1497,52 @@ static bool html_conversion_prepare(html_content *htmlc)
+ }
+ 
+ /* exported function documented in html/private.h */
++/*
++ * A page's script realm is made when something first needs it
++ * (VitaSurf): a script to run, an inline handler, an activation or a
++ * form the prelude does for the page, or another realm reaching this
++ * window. Every document had been given one as its first element was
++ * parsed, and 43 of the 77 realms that reached their load event in
++ * build 793's site test ran no script of their own, ad and tracking
++ * frames mostly, each 280 ms of prelude and some 2.6 MB of heap.
++ *
++ * The window still learns at the first element that the page commits,
++ * which is when the page it replaces is frozen.
++ */
++void html_script_commit(html_content *c)
++{
++	union content_msg_data msg_data;
++
++	if (c->realm_committed || !c->enable_scripting) {
++		return;
++	}
++	c->realm_committed = true;
++	/* no thread asked for: only the commit */
++	msg_data.jsthread = NULL;
++	content_broadcast(&c->base, CONTENT_MSG_GETTHREAD, &msg_data);
++}
++
++bool html_script_realm(html_content *c)
++{
++	union content_msg_data msg_data;
++
++	if (c->jsthread != NULL) {
++		return true;
++	}
++	/* and not again while the window is making it */
++	if (!c->enable_scripting || c->aborted || c->realm_making) {
++		return false;
++	}
++	html_script_commit(c);
++	msg_data.jsthread = &c->jsthread;
++	c->realm_making = true;
++	content_broadcast(&c->base, CONTENT_MSG_GETTHREAD, &msg_data);
++	c->realm_making = false;
++	NSLOG(netsurf, INFO, "javascript context: %p (htmlc: %p)",
++	      c->jsthread, c);
++	return c->jsthread != NULL;
++}
++
+ bool html_layout_early(html_content *htmlc)
+ {
+ 	if (htmlc->layout != NULL) {
+@@ -1669,6 +1721,7 @@ html_begin_conversion_inner(html_content *htmlc)
+ 	 * started. Firing it also moves readyState to "interactive"
+ 	 * (VitaSurf). Window listeners live on the document node too.
+ 	 */
++	htmlc->dcl_fired = true;
+ 	if (htmlc->jsthread != NULL) {
+ 		js_fire_event(htmlc->jsthread, "DOMContentLoaded",
+ 			      htmlc->document,
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 7b9fad5d8..fb0fa5929 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1192,6 +1192,57 @@ html_object_mouse_action(html_content *html,
+ }
+ 
+ 
++/**
++ * Whether a click on node has an activation the prelude runs (VitaSurf):
++ * it is in a label or a details element's summary, or in an element
++ * with a popovertarget. A page with no realm gets one for these only.
++ */
++static bool activation_wants_script(struct dom_node *node)
++{
++	dom_node *n = node, *next;
++	int depth = 0;
++
++	dom_node_ref(n);
++	while (n != NULL && depth++ < 64) {
++		dom_node_type type = DOM_ELEMENT_NODE;
++		dom_string *name = NULL;
++		bool want = false, has = false;
++
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			if (dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
++			    name != NULL) {
++				size_t len = dom_string_byte_length(name);
++				const char *s = dom_string_data(name);
++
++				want = (len == 5 &&
++					strncasecmp(s, "label", 5) == 0) ||
++					(len == 7 &&
++					 strncasecmp(s, "summary", 7) == 0);
++				dom_string_unref(name);
++			}
++			if (!want && dom_element_has_attribute(n,
++					corestring_dom_popovertarget,
++					&has) == DOM_NO_ERR) {
++				want = has;
++			}
++		}
++		if (want) {
++			dom_node_unref(n);
++			return true;
++		}
++		if (dom_node_get_parent_node(n, &next) != DOM_NO_ERR) {
++			next = NULL;
++		}
++		dom_node_unref(n);
++		n = next;
++	}
++	if (n != NULL) {
++		dom_node_unref(n);
++	}
++	return false;
++}
++
+ /**
+  * determine if a url has a javascript scheme
+  *
+@@ -2105,7 +2156,8 @@ mouse_action_drag_none(html_content *html,
+ 			   mas.link.url == NULL &&
+ 			   (mas.result.action == ACTION_NONE ||
+ 			    mas.result.action == ACTION_NOSEND) &&
+-			   html->jsthread != NULL) {
++			   activation_wants_script(mas.node) &&
++			   html_script_realm(html)) {
+ 			/* what NetSurf does not do itself: a label passes
+ 			 * the click to its control, a summary opens its
+ 			 * details (VitaSurf) */
+@@ -2133,7 +2185,7 @@ mouse_action_drag_none(html_content *html,
+ 		 */
+ 		if (mas.gadget.control->form != NULL &&
+ 		    mas.gadget.control->form->node != NULL &&
+-		    html->jsthread != NULL) {
++		    html_script_realm(html)) {
+ 			struct form_control *fc;
+ 			int ix = 0, iy = 0;
+ 
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 9747434f5..42630acb9 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -519,8 +519,11 @@ html_object_callback(hlcache_handle *object,
+ 		break;
+ 
+ 	case CONTENT_MSG_GETTHREAD:
+-		/* Objects don't have JS threads */
+-		*(event->data.jsthread) = NULL;
++		/* Objects don't have JS threads; NULL is the commit alone
++		 * (VitaSurf) */
++		if (event->data.jsthread != NULL) {
++			*(event->data.jsthread) = NULL;
++		}
+ 		break;
+ 
+ 	case CONTENT_MSG_GETDIMS:
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 7bb9c87c7..a4774a85f 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -242,6 +242,15 @@ typedef struct html_content {
+ 	struct html_script *scripts;
+ 	/** javascript thread in use */
+ 	struct jsthread *jsthread;
++	/*
++	 * The realm is made when something first needs it (VitaSurf): see
++	 * html_script_realm. Whether the window has been told the page
++	 * commits, and how far the page had got, for a realm made late.
++	 */
++	bool realm_committed;
++	bool realm_making;
++	bool dcl_fired;
++	bool load_fired;
+ 
+ 	/** Number of entries in stylesheet_content. */
+ 	unsigned int stylesheet_count;
+@@ -708,6 +717,19 @@ eturn true if the content now has a layout
+  */
+ bool html_layout_early(html_content *htmlc);
+ 
++/**
++ * Tell the window that the page commits, once (VitaSurf): the page it
++ * replaces is frozen from here.
++ */
++void html_script_commit(html_content *c);
++
++/**
++ * The page's script realm, made now if it has none (VitaSurf).
++ *
++ * \return true if the page has a realm on return
++ */
++bool html_script_realm(html_content *c);
++
+ /**
+  * Put an element in a :hover, :active, :focus or :target state and
+  * restyle what that changes (VitaSurf): in place when only paint
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index cdd544a51..0e320d51a 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -1169,14 +1169,8 @@ bool html_process_module_preload(html_content *c, dom_string *href)
+ 	 * to run and the only one that does not depend on where in the
+ 	 * document the link happened to sit.
+ 	 */
+-	if (c->jsthread == NULL) {
+-		union content_msg_data msg_data;
+-
+-		msg_data.jsthread = &c->jsthread;
+-		content_broadcast(&c->base, CONTENT_MSG_GETTHREAD, &msg_data);
+-		if (c->jsthread == NULL) {
+-			return false;
+-		}
++	if (!html_script_realm(c)) {
++		return false;
+ 	}
+ 
+ 	ns_error = nsurl_join(c->base_url, dom_string_data(href), &joined);
+@@ -1267,16 +1261,9 @@ html_process_script(void *ctx, dom_node *node)
+ 	/* We should only ever be here if scripting was enabled for this
+ 	 * content so it's correct to make a javascript context if there
+ 	 * isn't one already. */
+-	if (c->jsthread == NULL) {
+-		union content_msg_data msg_data;
+-
+-		msg_data.jsthread = &c->jsthread;
+-		content_broadcast(&c->base, CONTENT_MSG_GETTHREAD, &msg_data);
+-		NSLOG(netsurf, INFO, "javascript context %p ", c->jsthread);
+-		if (c->jsthread == NULL) {
+-			/* no context and it could not be created, abort */
+-			return DOM_HUBBUB_OK;
+-		}
++	if (!html_script_realm(c)) {
++		/* no context and it could not be created, abort */
++		return DOM_HUBBUB_OK;
+ 	}
+ 
+ 	NSLOG(netsurf, INFO, "content %p parser %p node %p", c, c->parser,
+diff --git a/content/handlers/javascript/js.h b/content/handlers/javascript/js.h
+index b46580ba9..c7884fd94 100644
+--- a/content/handlers/javascript/js.h
++++ b/content/handlers/javascript/js.h
+@@ -30,6 +30,7 @@ struct dom_document;
+ struct dom_node;
+ struct dom_element;
+ struct dom_string;
++struct html_content;
+ 
+ /**
+  * JavaScript interpreter heap
+@@ -155,6 +156,13 @@ void js_activate(jsthread *thread, struct dom_node *target, int x, int y);
+  */
+ void js_fragment_navigated(jsthread *thread, const char *href);
+ 
++/**
++ * A page that has no script realm has loaded (VitaSurf): its iframe
++ * element in the page around it gets its load event, as one with a
++ * realm sends from its own.
++ */
++void js_loaded_without_realm(struct html_content *htmlc);
++
+ /**
+  * Submit a form the user submitted with a button, as script submits one
+  * (VitaSurf): the submit event naming the button, the HTML standard's
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index b6487766d..ada4784e9 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -1799,12 +1799,29 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 			 * window requires a new javascript thread object
+ 			 */
+ 			jsthread *thread;
+-			assert(bw->loading_content == c);
+ 
+-			/* the navigation commits: the page it replaces, and
+-			 * its frames, are frozen from here (VitaSurf) */
+-			bw->frozen_current = bw->current_content;
+-			browser_window_stop_left(bw);
++			/*
++			 * The navigation commits at the page's first
++			 * element: the page it replaces, and its frames, are
++			 * frozen from here (VitaSurf). That comes with no
++			 * thread to fill in; the page's realm is asked for
++			 * when something first needs it (html_script_realm),
++			 * which may be once it is the page the window shows,
++			 * and never for a page the window has left.
++			 */
++			if (event->data.jsthread == NULL) {
++				if (bw->loading_content == c) {
++					bw->frozen_current = bw->current_content;
++					browser_window_stop_left(bw);
++				}
++				break;
++			}
++			if (bw->loading_content != c &&
++			    (bw->current_content != c ||
++			     (bw->frozen_current == c &&
++			      bw->loading_content != NULL))) {
++				break;
++			}
+ 
+ 			if (js_newthread(bw->jsheap,
+ 					 bw,

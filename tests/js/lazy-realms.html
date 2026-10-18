@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<!--
+  Frames with no script of their own (VitaSurf).
+
+  A document is given its script realm when something first needs one:
+  a script, an inline handler, or another realm reaching its window.
+  Before, every document got one as its first element was parsed. The
+  frames here have no script, or get it late, and must look to the page
+  as they would in a browser: their iframe elements get load events and
+  the page's load waits for them, their windows and documents are their
+  own, a script put in later runs in the frame's realm and sees the
+  frame as it is, an inline handler runs, and a frame's script reaching
+  a parent with no script finds it. Each line must say PASS; Chrome
+  passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Frames without script</title></head>
+<body>
+<pre id="out"></pre>
+<iframe id="a" srcdoc="<p id=t>hello</p>"></iframe>
+<iframe id="b" srcdoc="<body onload=&quot;parent.inline.push('body load')&quot;><p>b</p></body>"></iframe>
+<iframe id="c" srcdoc="<p>mid</p><iframe srcdoc=&quot;<script>top.deep = parent.document.querySelector('p').textContent; top.deepParent = parent === parent.parent ? 'top' : 'middle';</script>&quot;></iframe>"></iframe>
+<script>
+var out = [], inline = [], loads = [], deep = null, deepParent = null;
+function ok(name, good, got) {
+  out.push((good ? 'PASS ' : 'FAIL ') + name + (good ? '' : ': ' + got));
+}
+function report() {
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('lazy-realms: ' + l); });
+  console.log('lazy-realms: done');
+}
+var a = document.getElementById('a'), b = document.getElementById('b'),
+    c = document.getElementById('c');
+a.addEventListener('load', function () {
+  var cw = a.contentWindow, cd = a.contentDocument;
+  loads.push('a');
+  ok('a frame with no script has its document',
+     cd !== null && cd.getElementById('t') !== null &&
+     cd.getElementById('t').textContent === 'hello',
+     cd && cd.body && cd.body.innerHTML);
+  ok('its document has loaded', cd.readyState === 'complete', cd.readyState);
+  ok('its window is its own', cw !== window && cw.document === cd &&
+     cw.parent === window && cw.frameElement === a, String(cw));
+  ok('it is window[0] and frames[0]', window[0] === cw && frames[0] === cw,
+     typeof window[0]);
+  ok('its nodes are of its own realm',
+     Object.getPrototypeOf(cd.body) === cw.HTMLBodyElement.prototype &&
+     cw.HTMLBodyElement !== HTMLBodyElement,
+     String(Object.getPrototypeOf(cd.body) === HTMLBodyElement.prototype));
+  var s = cd.createElement('script');
+  s.textContent = 'window.ran = document.readyState + " " + ' +
+    '(document.getElementById("t") ? "found" : "missing") + " " + ' +
+    '(window.parent === window ? "top" : "framed");';
+  cd.body.appendChild(s);
+  ok('a script put in later runs in the frame and sees it as it is',
+     cw.ran === 'complete found framed', cw.ran);
+  ok('the frame\'s globals are not the page\'s',
+     window.ran === undefined, String(window.ran));
+});
+b.addEventListener('load', function () {
+  loads.push('b');
+  ok('an inline handler in a frame with no script runs',
+     inline.join() === 'body load', inline.join());
+});
+c.addEventListener('load', function () {
+  var cw = c.contentWindow;
+  loads.push('c');
+  ok('a frame\'s script reaches a parent page that has no script',
+     deep === 'mid' && deepParent === 'middle', deep + ' ' + deepParent);
+  ok('the middle page and its frame are each other\'s',
+     cw[0] && cw[0].parent === cw && cw.parent === window,
+     String(cw[0]));
+});
+window.addEventListener('load', function () {
+  ok('the page\'s load waited for its frames',
+     loads.slice().sort().join() === 'a,b,c', loads.join());
+  setTimeout(report, 50);
+});
+</script>
+</body></html>

@@ -1800,6 +1800,9 @@ static dom_string *to_dom_string_len(const char *s, size_t len)
 
 static const char *shown_url(const char *url);
 static void deferred_load_check(void *p);
+static bool fire_event(jsthread *thread, const char *type,
+		       struct dom_document *doc, struct dom_node *target,
+		       bool catch_up);
 static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 			     bool whole);
 static bool realm_room(const char *what);
@@ -6131,13 +6134,61 @@ static jsthread *window_thread(struct browser_window *bw)
 }
 
 /*
+ * A page's thread, its realm made now if it has none (VitaSurf): a page
+ * gets one when something first needs it (html_script_realm), and
+ * another realm reaching its window is such a thing. Only a page that
+ * has committed, its first element parsed, is given one; until then
+ * the window is the page it shows.
+ */
+static jsthread *content_thread_make(struct hlcache_handle *h)
+{
+	jsthread *t = content_thread(h);
+	html_content *htmlc;
+
+	if (t != NULL || h == NULL || content_get_type(h) != CONTENT_HTML) {
+		return t;
+	}
+	htmlc = (html_content *)hlcache_handle_get_content(h);
+	if (htmlc == NULL || htmlc->jsthread != NULL ||
+	    !htmlc->realm_committed || !html_script_realm(htmlc)) {
+		return NULL;
+	}
+	return content_thread(h);
+}
+
+/* window_thread, making the page's realm if it has none */
+static jsthread *window_thread_make(struct browser_window *bw)
+{
+	jsthread *t;
+
+	if (bw == NULL) {
+		return NULL;
+	}
+	t = content_thread_make(bw->loading_content);
+	return t != NULL ? t : content_thread_make(bw->current_content);
+}
+
+/*
  * The page a frame's iframe element is in (VitaSurf). Its parent window
  * can hold two pages while a new one loads over the one on screen, and
  * picking by window gave a frame of either page the other as its parent:
  * claude.ai's frames and the Cloudflare page loading over it held each
  * other's objects, and a closed page's 70 MB stayed in use.
  */
-static jsthread *frame_parent_thread(struct browser_window *bw)
+/* the page a handle holds, if it is HTML and its document is doc */
+static bool content_has_document(struct hlcache_handle *h,
+				 struct dom_document *doc)
+{
+	struct content *c;
+
+	if (h == NULL || content_get_type(h) != CONTENT_HTML) {
+		return false;
+	}
+	c = hlcache_handle_get_content(h);
+	return c != NULL && ((html_content *)c)->document == doc;
+}
+
+static jsthread *frame_parent_lookup(struct browser_window *bw, bool make)
 {
 	struct dom_document *doc = NULL;
 	jsthread *t = NULL;
@@ -6148,24 +6199,36 @@ static jsthread *frame_parent_thread(struct browser_window *bw)
 	if (bw->frame_node != NULL &&
 	    dom_node_get_owner_document(bw->frame_node, &doc) == DOM_NO_ERR &&
 	    doc != NULL) {
-		jsthread *a = content_thread(bw->parent->loading_content);
-		jsthread *b = content_thread(bw->parent->current_content);
+		struct hlcache_handle *a = bw->parent->loading_content;
+		struct hlcache_handle *b = bw->parent->current_content;
 
-		if (a != NULL && thread_document(a) == doc) {
-			t = a;
-		} else if (b != NULL && thread_document(b) == doc) {
-			t = b;
+		if (content_has_document(a, doc)) {
+			t = make ? content_thread_make(a) : content_thread(a);
+		} else if (content_has_document(b, doc)) {
+			t = make ? content_thread_make(b) : content_thread(b);
 		}
 		dom_node_unref(doc);
 		/* the element's page is neither: it is going */
 		return t;
 	}
-	return window_thread(bw->parent);
+	return make ? window_thread_make(bw->parent) : window_thread(bw->parent);
+}
+
+static jsthread *frame_parent_thread(struct browser_window *bw)
+{
+	return frame_parent_lookup(bw, false);
+}
+
+/* the page around a frame, its realm made if it has none: what the
+   frame's script reaches as parent, top or frameElement */
+static jsthread *frame_parent_thread_make(struct browser_window *bw)
+{
+	return frame_parent_lookup(bw, true);
 }
 
 static JSValue window_global(struct browser_window *bw)
 {
-	jsthread *t = window_thread(bw);
+	jsthread *t = window_thread_make(bw);
 
 	return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
 }
@@ -6266,14 +6329,19 @@ static JSValue win_vita_frame_start(JSContext *ctx, JSValueConst this_val,
 	/* A frame's page is a whole realm with the prelude run in it: say
 	 * what one cost, for the first few a page makes. Counting the
 	 * runtime walks the heap, so not for every one. */
-	if (bw->iframe_count > before && window_thread(frame) != NULL &&
-	    thread->frames_logged < 8) {
-		thread->frames_logged++;
-		vita_log("qjs: an iframe's blank page, made for script in %u ms;"
-			 " runtime now %u KB",
-			 (unsigned)(now_ms() - t0), runtime_kb(thread->heap->rt));
+	{
+		JSValue g = window_global(frame);
+
+		if (bw->iframe_count > before && !JS_IsNull(g) &&
+		    thread->frames_logged < 8) {
+			thread->frames_logged++;
+			vita_log("qjs: an iframe's blank page, made for script "
+				 "in %u ms; runtime now %u KB",
+				 (unsigned)(now_ms() - t0),
+				 runtime_kb(thread->heap->rt));
+		}
+		return g;
 	}
-	return window_global(frame);
 }
 
 /*
@@ -6541,7 +6609,7 @@ static JSValue win_vita_parent_global(JSContext *ctx, JSValueConst this_val,
 	(void)argc;
 	(void)argv;
 	{
-		jsthread *t = frame_parent_thread(bw);
+		jsthread *t = frame_parent_thread_make(bw);
 
 		return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
 	}
@@ -6565,7 +6633,7 @@ static JSValue win_vita_top_global(JSContext *ctx, JSValueConst this_val,
 
 		/* page by page up the iframe elements, as parent does */
 		while (bw->parent != NULL) {
-			t = frame_parent_thread(bw);
+			t = frame_parent_thread_make(bw);
 			bw = bw->parent;
 		}
 		return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
@@ -6655,7 +6723,7 @@ static JSValue win_vita_frame_element(JSContext *ctx, JSValueConst this_val,
 	if (bw == NULL || bw->parent == NULL || bw->frame_node == NULL) {
 		return JS_NULL;
 	}
-	t = frame_parent_thread(bw);
+	t = frame_parent_thread_make(bw);
 	return t != NULL ? wrap_node(t->ctx, bw->frame_node) : JS_NULL;
 }
 
@@ -21128,6 +21196,30 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 		}
 		return NSERROR_NOMEM;
 	}
+	/* a realm made once the page was under way starts where it is
+	   (VitaSurf): see html_script_realm */
+	if (doc_priv != NULL) {
+		html_content *htmlc = doc_priv;
+
+		if (htmlc->load_fired) {
+			ret->ready_state = "complete";
+		} else if (htmlc->dcl_fired) {
+			ret->ready_state = "interactive";
+		}
+		/* the page holds it from here, as the window's answer
+		   will have it, so that what the prelude's listeners do to
+		   the document finds it */
+		htmlc->jsthread = ret;
+		if (htmlc->dcl_fired) {
+			vita_log("qjs: a realm for a page already %s",
+				 ret->ready_state);
+			fire_event(ret, "DOMContentLoaded", htmlc->document,
+				   NULL, true);
+		}
+		if (htmlc->load_fired) {
+			fire_event(ret, "load", htmlc->document, NULL, true);
+		}
+	}
 	*thread = ret;
 	vita_log("qjs: new thread win=%p doc=%p", win_priv, doc_priv);
 	return NSERROR_OK;
@@ -24534,16 +24626,41 @@ void vita_js_scrolled(struct browser_window *bw)
 #define LOAD_WAIT_MAX_MS 20000
 
 /** Whether a frame window's page has fired its load event. */
+/* a script page with no realm yet: whether its load has come
+   (VitaSurf), or -1 for a page that is not one */
+static int frame_unrealmed_loaded(struct hlcache_handle *h)
+{
+	html_content *htmlc;
+
+	if (h == NULL || content_get_type(h) != CONTENT_HTML) {
+		return -1;
+	}
+	htmlc = (html_content *)hlcache_handle_get_content(h);
+	if (htmlc == NULL || htmlc->jsthread != NULL ||
+	    !htmlc->enable_scripting || htmlc->aborted) {
+		return -1;
+	}
+	return htmlc->load_fired ? 1 : 0;
+}
+
 static bool frame_loaded(struct browser_window *w)
 {
 	jsthread *t;
+	int unrealmed;
 
 	if (w->loading_content != NULL) {
 		t = content_thread(w->loading_content);
-		return t != NULL && t->ready_state != NULL &&
+		if (t == NULL) {
+			return frame_unrealmed_loaded(w->loading_content) == 1;
+		}
+		return t->ready_state != NULL &&
 			strcmp(t->ready_state, "complete") == 0;
 	}
 	t = content_thread(w->current_content);
+	if (t == NULL &&
+	    (unrealmed = frame_unrealmed_loaded(w->current_content)) >= 0) {
+		return unrealmed == 1;
+	}
 	/* a page without script (sandboxed, or not HTML) is loaded once
 	 * it is what the frame shows */
 	return t == NULL || (t->ready_state != NULL &&
@@ -24682,8 +24799,15 @@ static void log_inline_session(JSContext *ctx)
 	}
 }
 
-bool js_fire_event(jsthread *thread, const char *type,
-		   struct dom_document *doc, struct dom_node *target)
+/*
+ * catch_up is a realm made after the page's DOMContentLoaded or load
+ * (VitaSurf): the prelude's own listeners hear the event, which no page
+ * code can yet have heard, and nothing else happens again: no waiting
+ * for frames, no report, and no load event for the iframe element.
+ */
+static bool fire_event(jsthread *thread, const char *type,
+		       struct dom_document *doc, struct dom_node *target,
+		       bool catch_up)
 {
 	struct dom_event *evt;
 	dom_string *type_dom;
@@ -24693,7 +24817,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 		return true;
 	}
 	if (target == NULL && strcmp(type, "load") == 0 &&
-	    !thread->load_releasing) {
+	    !thread->load_releasing && !catch_up) {
 		if (thread->load_deferred) {
 			return true;
 		}
@@ -24711,7 +24835,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 	} else if (strcmp(type, "load") == 0) {
 		thread->ready_state = "complete";
 	}
-	if (strcmp(type, "load") == 0) {
+	if (strcmp(type, "load") == 0 && !catch_up) {
 		uint32_t lazy_n, lazy_ms;
 
 		bc_index_flush();
@@ -24796,7 +24920,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 	 * around it gets a load event too, which is how that page learns
 	 * the frame is ready (VitaSurf).
 	 */
-	if (target == NULL && strcmp(type, "load") == 0) {
+	if (target == NULL && strcmp(type, "load") == 0 && !catch_up) {
 		struct browser_window *bw = thread->win;
 
 		if (bw != NULL && bw->parent != NULL &&
@@ -24822,6 +24946,12 @@ bool js_fire_event(jsthread *thread, const char *type,
 		}
 	}
 	return true;
+}
+
+bool js_fire_event(jsthread *thread, const char *type,
+		   struct dom_document *doc, struct dom_node *target)
+{
+	return fire_event(thread, type, doc, target, false);
 }
 
 bool js_dom_event_add_listener(jsthread *thread,
@@ -25010,6 +25140,59 @@ bool js_implicit_submit(jsthread *thread, struct dom_node *form)
 }
 
 /* exported interface documented in js.h (VitaSurf) */
+/*
+ * A page with no realm has loaded (VitaSurf). Its iframe element in the
+ * page around it gets the load event that a page with a realm sends
+ * from its own load (js_fire_event), and that page, if its load waits
+ * on its frames, looks again.
+ */
+void js_loaded_without_realm(struct html_content *htmlc)
+{
+	jsthread *t;
+
+	if (htmlc == NULL) {
+		return;
+	}
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		struct browser_window *bw = t->win;
+		int i;
+
+		if (t->closed || t->is_worker || t->ctx == NULL || bw == NULL) {
+			continue;
+		}
+		for (i = 0; i < bw->iframe_count; i++) {
+			struct browser_window *f = bw->iframes[i];
+			struct dom_event *evt;
+			dom_string *type_dom;
+			bool success = false;
+
+			if (f == NULL || f->frame_node == NULL ||
+			    (hlcache_handle_get_content(f->current_content) !=
+			     (struct content *)htmlc &&
+			     hlcache_handle_get_content(f->loading_content) !=
+			     (struct content *)htmlc) ||
+			    frame_parent_thread(f) != t) {
+				continue;
+			}
+			if (dom_event_create(&evt) == DOM_NO_ERR) {
+				type_dom = to_dom_string("load");
+				if (type_dom != NULL) {
+					dom_event_init(evt, type_dom, false,
+						       false);
+					dom_string_unref(type_dom);
+					dom_event_target_dispatch_event(
+						f->frame_node, evt, &success);
+				}
+				dom_event_unref(evt);
+			}
+			if (t->load_deferred) {
+				guit->misc->schedule(0, deferred_load_check, t);
+			}
+			return;
+		}
+	}
+}
+
 void js_fragment_navigated(jsthread *thread, const char *href)
 {
 	JSContext *ctx;

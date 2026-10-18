@@ -5596,23 +5596,37 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   if(/^about:/i.test(h))return 'opaque '+h;
   try{var u=new URL(h);return u.protocol==='file:'?'file:':u.origin;}
   catch(e){return 'null';}}
+ /* a blank or srcdoc page's origin is its parent's, which may be one
+    too: the parent's own realm answers for it, up the frames, where a
+    srcdoc frame in a srcdoc frame had been given none (VitaSurf) */
+ function natOf(g){try{return NV.__vitaNativesOf(g);}catch(e){return null;}}
  function myKey(){
-  var h=hrefOf(W),p;
+  var h=hrefOf(W),p,pn;
   if(inherits(h)&&(p=call(NP))){
+   pn=p!==W?natOf(p):null;
+   if(pn&&typeof pn.__vitaOriginKey==='function')return pn.__vitaOriginKey();
    var ph=hrefOf(p);return inherits(ph)?'null':keyOfHref(ph);}
   return keyOfHref(h);}
  function keyOf(g){
   if(g===W)return myKey();
-  var h=hrefOf(g);
-  return inherits(h)?myKey():keyOfHref(h);}
+  var h=hrefOf(g),gn;
+  if(!inherits(h))return keyOfHref(h);
+  gn=natOf(g);
+  return gn&&typeof gn.__vitaOriginKey==='function'?gn.__vitaOriginKey():myKey();}
  /* what event.origin says for a window */
  function originOf(g){
-  var h=g===W?hrefOf(W):hrefOf(g),p;
+  var h=g===W?hrefOf(W):hrefOf(g),p,n;
   if(/^about:/i.test(h)&&!inherits(h))return 'null';
   if(inherits(h)){
-   if(g!==W)return originOf(W);
-   p=call(NP);return p?originOf(p):'null';}
+   if(g!==W){n=natOf(g);
+    return n&&typeof n.__vitaOriginOf==='function'?n.__vitaOriginOf():originOf(W);}
+   p=call(NP);
+   if(!p||p===W)return 'null';
+   n=natOf(p);
+   return n&&typeof n.__vitaOriginOf==='function'?n.__vitaOriginOf():originOf(p);}
   try{return new URL(h).origin;}catch(e){return 'null';}}
+ NV.__vitaOriginKey=myKey;
+ NV.__vitaOriginOf=function(){return originOf(W);};
  var CROSS=new WeakMap();
  /* a raw global as this page may see it */
  /* A frame of another origin is seen through one window for as long as
