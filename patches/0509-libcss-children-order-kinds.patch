@@ -1,0 +1,185 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 13aed5b..343b226 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -57,6 +57,26 @@ typedef enum css_select_handler_version {
+ 	CSS_SELECT_HANDLER_VERSION_1 = 1
+ } css_select_handler_version;
+ 
++/**
++ * What a selector read about a node's place among its siblings, or its
++ * children (VitaSurf): see css_select_handler's note_order.
++ */
++enum css_order_read {
++	/** its own children: :empty, :has() */
++	CSS_ORDER_CHILDREN = 1,
++	/** its previous element sibling, or whether it has one: '+',
++	 * :first-child, :first-of-type */
++	CSS_ORDER_PREV = 2,
++	/** any earlier sibling: '~', :nth-child(), :nth-of-type() */
++	CSS_ORDER_PRECEDING = 4,
++	/** its next element sibling, or whether it has one: :last-child,
++	 * :last-of-type */
++	CSS_ORDER_NEXT = 8,
++	/** any later sibling: :nth-last-child(), :nth-last-of-type(), and
++	 * a :has() whose argument begins with '+' or '~' */
++	CSS_ORDER_FOLLOWING = 16
++};
++
+ typedef struct css_select_handler {
+ 	/** ABI version of this structure */
+ 	uint32_t handler_version;
+@@ -270,18 +290,19 @@ typedef struct css_select_handler {
+ 	css_error (*node_tree_scope)(void *pw, void *node, void **scope);
+ 
+ 	/**
+-	 * A selector asked about \a node's place among its siblings, or
+-	 * about its children (VitaSurf): with \a children false, a
+-	 * sibling combinator or a pseudo-class of position tested \a node,
+-	 * so a child put into or taken from its parent can change what
+-	 * matches there; with \a children true, :empty or :has() looked
+-	 * at its children, so one put into or taken from \a node can. A
+-	 * client that changes the tree in place learns from it which
+-	 * insertions need more than the new element selected. NULL when
+-	 * the client does not ask. Style sharing never calls it: a
+-	 * sibling shares only what it would have been given.
++	 * What a selector read of \a node's place, or of its children
++	 * (VitaSurf), as css_order_read bits: a sibling combinator or a
++	 * pseudo-class of position tested \a node, so a child put into
++	 * or taken from its parent can change what matches there, and
++	 * the bits say which of its siblings it looked at; with
++	 * CSS_ORDER_CHILDREN, :empty or :has() looked at its children,
++	 * so one put into or taken from \a node can. A client that
++	 * changes the tree in place learns from it which insertions need
++	 * more than the new element selected, and which siblings then.
++	 * NULL when the client does not ask. Style sharing never calls
++	 * it: a sibling shares only what it would have been given.
+ 	 */
+-	void (*note_order)(void *pw, void *node, bool children);
++	void (*note_order)(void *pw, void *node, unsigned what);
+ 
+ 	/**
+ 	 * A :has() was tried on \a node (VitaSurf), so a change in what
+diff --git a/src/select/select.c b/src/select/select.c
+index 2cd9bfd..34d415b 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -155,10 +155,36 @@ typedef struct css_select_font_faces_state {
+ 
+ /** Tell the client a selector looked at node's siblings or children. */
+ static inline void note_order(const css_select_state *state, void *node,
+-		bool children)
++		unsigned what)
+ {
+ 	if (state->handler->note_order != NULL && node != NULL)
+-		state->handler->note_order(state->pw, node, children);
++		state->handler->note_order(state->pw, node, what);
++}
++
++/** What a position test reads of the node's siblings (VitaSurf). */
++static unsigned self_order(enum css_self_test test)
++{
++	switch (test) {
++	case CSS_SELF_FIRST_CHILD:
++	case CSS_SELF_FIRST_OF_TYPE:
++		return CSS_ORDER_PREV;
++	case CSS_SELF_LAST_CHILD:
++	case CSS_SELF_LAST_OF_TYPE:
++		return CSS_ORDER_NEXT;
++	case CSS_SELF_ONLY_CHILD:
++	case CSS_SELF_ONLY_OF_TYPE:
++		return CSS_ORDER_PREV | CSS_ORDER_NEXT;
++	case CSS_SELF_NTH_CHILD:
++	case CSS_SELF_NTH_OF_TYPE:
++		return CSS_ORDER_PRECEDING;
++	case CSS_SELF_NTH_LAST_CHILD:
++	case CSS_SELF_NTH_LAST_OF_TYPE:
++		return CSS_ORDER_FOLLOWING;
++	case CSS_SELF_EMPTY:
++		return CSS_ORDER_CHILDREN;
++	default:
++		return 0;
++	}
+ }
+ 
+ /** Tell the client a :has() was tried on node. */
+@@ -4591,7 +4617,7 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 				return error;
+ 			break;
+ 		case CSS_COMBINATOR_SIBLING:
+-			note_order(state, n, false);
++			note_order(state, n, CSS_ORDER_PREV);
+ 			error = state->handler->named_sibling_node(state->pw,
+ 					n, &selector->data.qname, &n);
+ 			if (error != CSS_OK)
+@@ -4602,7 +4628,7 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 			}
+ 			break;
+ 		case CSS_COMBINATOR_GENERIC_SIBLING:
+-			note_order(state, n, false);
++			note_order(state, n, CSS_ORDER_PRECEDING);
+ 			error = state->handler->named_generic_sibling_node(
+ 					state->pw, n, &selector->data.qname,
+ 					&n);
+@@ -4756,7 +4782,9 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
+ 			break;
+ 		case CSS_COMBINATOR_SIBLING:
+ 		case CSS_COMBINATOR_GENERIC_SIBLING:
+-			note_order(state, n, false);
++			note_order(state, n, type ==
++					CSS_COMBINATOR_SIBLING ?
++					CSS_ORDER_PREV : CSS_ORDER_PRECEDING);
+ 			error = state->handler->sibling_node(state->pw, n, &n);
+ 			if (error != CSS_OK)
+ 				return error;
+@@ -5484,7 +5512,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 
+ 	if (h->first_child_node == NULL || h->next_sibling_node == NULL)
+ 		return CSS_OK;
+-	note_order(state, node, true);
++	note_order(state, node, CSS_ORDER_CHILDREN);
+ 	note_has(state, node, false);
+ 
+ 	for (; sub != NULL; sub = sub->combinator) {
+@@ -5497,7 +5525,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 				state->node_data->flags |=
+ 						CSS_NODE_FLAGS_TAINT_SIBLING;
+ 			}
+-			note_order(state, node, false);
++			note_order(state, node, CSS_ORDER_FOLLOWING);
+ 			note_has(state, node, true);
+ 			error = h->next_sibling_node(state->pw, node, &n);
+ 			if (error != CSS_OK)
+@@ -5549,7 +5577,7 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 
+ 				/* Down, else along, else up until there is
+ 				 * an along, stopping at the subject. */
+-				note_order(state, n, true);
++				note_order(state, n, CSS_ORDER_CHILDREN);
+ 				error = h->first_child_node(state->pw, n,
+ 						&next);
+ 				if (error != CSS_OK)
+@@ -5717,7 +5745,8 @@ static css_error match_nth_of(css_select_ctx *ctx, void *node,
+ 	if (head == NULL || h->sibling_node == NULL ||
+ 			h->next_sibling_node == NULL)
+ 		return CSS_OK;
+-	note_order(state, node, false);
++	note_order(state, node, last ? CSS_ORDER_FOLLOWING :
++			CSS_ORDER_PRECEDING);
+ 
+ 	error = match_any_compound(ctx, node, head->combinator, state, match);
+ 	if (error != CSS_OK || *match == false)
+@@ -5821,11 +5850,8 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 				a = detail->value.nth.a;
+ 				b = detail->value.nth.b;
+ 			}
+-			if (test <= CSS_SELF_ONLY_OF_TYPE ||
+-					test >= CSS_SELF_NTH_CHILD)
+-				note_order(state, node, false);
+-			else if (test == CSS_SELF_EMPTY)
+-				note_order(state, node, true);
++			if (self_order(test) != 0)
++				note_order(state, node, self_order(test));
+ 			if (node == state->node) {
+ 				/*
+ 				 * Answered once per selection and kept

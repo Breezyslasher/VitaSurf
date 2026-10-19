@@ -2397,7 +2397,8 @@ static void tree_name(struct dom_node *n, char *out, size_t size)
 
 static void attr_journal_add(jsthread *thread, struct dom_node *node,
 			     dom_string *name, dom_string *old, bool slots,
-			     struct dom_node *child);
+			     struct dom_node *child, struct dom_node *after,
+			     bool out);
 
 /* Whether a node is in the thread's document. */
 /* A shadow root's host, referenced, or NULL (VitaSurf). */
@@ -2551,7 +2552,7 @@ static void mark_tree_dirty(JSContext *ctx, const char *what,
 			    bool new_slots)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
-	struct dom_node *from = NULL;
+	struct dom_node *from = NULL, *after = NULL;
 
 	if (thread != NULL && !thread->tree_dirty && !thread->closed &&
 	    parent != NULL) {
@@ -2563,6 +2564,12 @@ static void mark_tree_dirty(JSContext *ctx, const char *what,
 		    from != NULL) {
 			from_in = from != parent &&
 				  node_in_page(thread, from);
+			/* where it is taken from, for the siblings a selector
+			 * reads there */
+			if (dom_node_get_next_sibling(child, &after) !=
+			    DOM_NO_ERR) {
+				after = NULL;
+			}
 		}
 		if (in || from_in) {
 			/* slots may take other children now */
@@ -2577,11 +2584,14 @@ static void mark_tree_dirty(JSContext *ctx, const char *what,
 		thread->dom_dirty = true;
 		if (in) {
 			attr_journal_add(thread, parent, NULL, NULL, slots,
-					 child);
+					 child, after, from == parent);
 		}
 		if (from_in) {
 			attr_journal_add(thread, from, NULL, NULL, slots,
-					 child);
+					 child, after, true);
+		}
+		if (after != NULL) {
+			dom_node_unref(after);
 		}
 		if (from != NULL) {
 			dom_node_unref(from);
@@ -2611,6 +2621,20 @@ static void mark_tree_dirty(JSContext *ctx, const char *what,
 	mark_dirty(ctx);
 }
 
+/* A change of children that is no longer of one child (VitaSurf). */
+static void attr_change_drop_child(struct html_attr_change *c)
+{
+	if (c->child != NULL) {
+		dom_node_unref(c->child);
+		c->child = NULL;
+	}
+	if (c->after != NULL) {
+		dom_node_unref(c->after);
+		c->after = NULL;
+	}
+	c->out = false;
+}
+
 /* the most attribute changes kept for one layout; past it, a rebuild */
 #define ATTR_JOURNAL_MAX 512
 
@@ -2622,9 +2646,7 @@ static void attr_journal_clear(jsthread *thread)
 		struct html_attr_change *c = &thread->attr_changes[i];
 
 		dom_node_unref(c->node);
-		if (c->child != NULL) {
-			dom_node_unref(c->child);
-		}
+		attr_change_drop_child(c);
 		if (c->name != NULL) {
 			dom_string_unref(c->name);
 		}
@@ -2644,7 +2666,8 @@ static void attr_journal_clear(jsthread *thread)
    and NULL when more than one has changed (VitaSurf). */
 static void attr_journal_add(jsthread *thread, struct dom_node *node,
 			     dom_string *name, dom_string *old, bool slots,
-			     struct dom_node *child)
+			     struct dom_node *child, struct dom_node *after,
+			     bool out)
 {
 	struct html_attr_change *c;
 	unsigned i;
@@ -2652,18 +2675,38 @@ static void attr_journal_add(jsthread *thread, struct dom_node *node,
 	if (thread->tree_dirty || thread->closed || node == NULL) {
 		return;
 	}
+	unsigned kids = 0;
+	struct html_attr_change *first_kid = NULL;
+
 	for (i = thread->attr_n; i-- > 0 && i + 64 >= thread->attr_n; ) {
 		c = &thread->attr_changes[i];
 		if (c->node == node && (name == NULL ? c->name == NULL :
 		    c->name != NULL && dom_string_isequal(c->name, name))) {
 			thread->attr_slots = thread->attr_slots || slots;
+			/*
+			 * Each child put in or taken out is a change of its
+			 * own, up to a few for an element, so that each can be
+			 * built on its own (VitaSurf): two put into the body
+			 * together had been one change with no child, and the
+			 * whole page was built again for it.
+			 */
+			if (name == NULL && c->child != NULL &&
+			    child != NULL && c->child != child && !slots) {
+				kids++;
+				first_kid = c;
+				continue;
+			}
 			if (c->child != NULL && c->child != child) {
 				/* more than one */
-				dom_node_unref(c->child);
-				c->child = NULL;
+				attr_change_drop_child(c);
 			}
 			return;
 		}
+	}
+	if (kids >= 16 && first_kid != NULL) {
+		/* so many that they are one change of the element's */
+		attr_change_drop_child(first_kid);
+		return;
 	}
 	if (thread->attr_n == ATTR_JOURNAL_MAX) {
 		snprintf(thread->tree_why, sizeof(thread->tree_why),
@@ -2688,6 +2731,8 @@ static void attr_journal_add(jsthread *thread, struct dom_node *node,
 	c->name = name != NULL ? dom_string_ref(name) : NULL;
 	c->old = old != NULL ? dom_string_ref(old) : NULL;
 	c->child = child != NULL && !slots ? dom_node_ref(child) : NULL;
+	c->out = c->child != NULL && out;
+	c->after = c->out && after != NULL ? dom_node_ref(after) : NULL;
 	thread->attr_slots = thread->attr_slots || slots;
 }
 
@@ -2709,7 +2754,8 @@ static void mark_attr_dirty(JSContext *ctx, struct dom_node *node,
 	if (thread != NULL) {
 		thread->dom_dirty = true;
 		if (node_in_page(thread, node)) {
-			attr_journal_add(thread, node, key, old, false, NULL);
+			attr_journal_add(thread, node, key, old, false, NULL,
+					 NULL, false);
 		}
 	}
 }
@@ -2732,7 +2778,7 @@ static void mark_text_dirty(JSContext *ctx, struct dom_node *node,
 		thread->dom_dirty = true;
 		if (node_in_page(thread, node)) {
 			attr_journal_add(thread, node, NULL, NULL, false,
-					 NULL);
+					 NULL, NULL, false);
 		}
 	}
 }
@@ -4525,6 +4571,10 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	child = JS_GetOpaque(argv[0], node_class_id);
 	old = JS_GetOpaque(argv[1], node_class_id);
 	if (child == NULL || old == NULL) return JS_UNDEFINED;
+	/* the child it replaces is taken out (VitaSurf): only the new one
+	 * had been noted, and the old one's boxes stayed on the page */
+	mark_tree_dirty(ctx, "replaceChild", node, old,
+			subtree_has_slot(old));
 	mark_tree_dirty(ctx, "replaceChild", node, child,
 			subtree_has_slot(old));
 	notify_left_parent(ctx, child, node);
@@ -18077,7 +18127,7 @@ static JSValue win_vita_popover(JSContext *ctx, JSValueConst this_val,
 			}
 			thread->dom_dirty = true;
 			attr_journal_add(thread, node, attr, value, false,
-					 NULL);
+					 NULL, NULL, false);
 			if (value != NULL) {
 				dom_string_unref(value);
 			}

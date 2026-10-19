@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<!--
+  replaceChild takes the old child's boxes off the page (VitaSurf): only
+  the new child had been noted as changed, so it was built in its place
+  on its own (box_child_build) and the old one's boxes stayed, drawn and
+  taking taps, with everything after them pushed down. A block taken out
+  of the body is taken out of its boxes on its own too, where the page
+  had been built again. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>replaceChild boxes</title>
+<style>
+body { margin: 0; font: 16px/20px sans-serif; }
+div { height: 20px; }
+</style></head>
+<body><div id="a">a</div><div id="b">b</div><div id="c">c</div><div id="d">d</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) {
+  var l = (got === want ? 'PASS ' : 'FAIL ') + name +
+    (got === want ? '' : ': ' + got + ', want ' + want);
+  out.push(l); console.log('replace-child: ' + l);
+}
+function $(id) { return document.getElementById(id); }
+function at(y) { var e = document.elementFromPoint(5, y); return e && e.id; }
+function el(id, h) {
+  var e = document.createElement('div');
+  e.id = id; e.textContent = id;
+  if (h) e.style.height = h + 'px';
+  return e;
+}
+var steps = [
+  function () {
+    document.body.replaceChild(el('n'), $('b'));
+  },
+  function () {
+    ok('the new child is where the old one was', $('n').offsetTop, 20);
+    ok('what follows is where it was', $('c').offsetTop, 40);
+    ok('a tap there finds the new child', at(25), 'n');
+    document.body.replaceChild(el('m', 50), $('c'));
+  },
+  function () {
+    ok('a taller one moves what follows', $('d').offsetTop, 90);
+    ok('a tap below its top half finds it', at(80), 'm');
+    document.body.removeChild($('a'));
+  },
+  function () {
+    ok('a block taken out leaves no room', $('n').offsetTop, 0);
+    ok('nor anything to tap', at(5), 'n');
+    $('out').textContent = out.join('\n');
+    console.log('replace-child: done');
+  }
+];
+addEventListener('load', function () {
+  var i = 0;
+  (function next() {
+    steps[i++]();
+    if (i < steps.length)
+      setTimeout(next, 120);
+  })();
+});
+</script>
+</body></html>

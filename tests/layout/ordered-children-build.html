@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<!--
+  Children put into an element whose children's order a selector reads
+  (VitaSurf, patch 0509/0510): libcss says which siblings a selector
+  read ('+' and :first-* the previous one, '~' and :nth-child() any
+  earlier one, :last-* the next one, :nth-last-child() any later one),
+  and the new child is built on its own with only the siblings that can
+  change restyled in place. Any such selector had the whole page built
+  again: yahoo.com's banner put into its body, whose children
+  :first-child and '+' rules read, and CNN's, Stack Overflow's and
+  ESPN's, 0.4 to 2.3 s each in build 800's log. A child taken out has
+  its boxes taken out on its own, and the siblings at its place
+  restyled the same way. The log must not say "need the layout
+  rebuilt" for these steps, and each line must say PASS, as in a
+  browser. The children go into the body, which has no block of its own
+  to build again.
+-->
+<html><head><meta charset="utf-8"><title>Ordered children built</title>
+<style>
+body { margin: 0; font: 16px/20px sans-serif; }
+body > div, body > p { margin: 0; height: 20px; }
+body > :first-child { color: rgb(255, 0, 0); }
+body > :last-child { height: 22px; }
+body > :nth-child(2) { background-color: rgb(0, 0, 255); }
+body > :nth-last-child(2) { padding-left: 7px; }
+body > p:last-of-type { font-weight: 700; }
+body > :only-child { border-top: 2px solid; }
+.s + .t { height: 31px; }
+.s ~ .u { color: rgb(0, 128, 0); }
+</style>
+<script>
+var out = [];
+function ok(name, got, want) {
+  var l = (got === want ? 'PASS ' : 'FAIL ') + name +
+    (got === want ? '' : ': ' + got + ', want ' + want);
+  out.push(l); console.log('ordered-children: ' + l);
+}
+function $(id) { return document.getElementById(id); }
+function cs(id, p) { return getComputedStyle($(id)).getPropertyValue(p); }
+function el(tag, id, attrs) {
+  var e = document.createElement(tag);
+  e.id = id; e.textContent = id;
+  for (var k in attrs || {}) e.setAttribute(k, attrs[k]);
+  return e;
+}
+var steps = [
+  function () {
+    ok('the only child has its border', cs('a', 'border-top-width'), '2px');
+    document.body.appendChild(el('div', 'b'));
+  },
+  function () {
+    ok('a child put in after the only one ends its being only',
+       cs('a', 'border-top-width'), '0px');
+    ok('the new last child is 22px', $('b').offsetHeight, 22);
+    ok('the old last child is not any more', $('a').offsetHeight, 20);
+    ok('the new one is second', cs('b', 'background-color'), 'rgb(0, 0, 255)');
+    ok('the first is second from the end', cs('a', 'padding-left'), '7px');
+    document.body.appendChild(el('div', 'c'));
+  },
+  function () {
+    ok('one more at the end: the last is new', $('c').offsetHeight, 22);
+    ok('the one before it is second from the end', cs('b', 'padding-left'), '7px');
+    ok('and the first is not', cs('a', 'padding-left'), '0px');
+    document.body.insertBefore(el('div', 'z'), $('a'));
+  },
+  function () {
+    ok('one put in first is first', cs('z', 'color'), 'rgb(255, 0, 0)');
+    ok('the old first is not', cs('a', 'color'), 'rgb(0, 0, 0)');
+    ok('the old first is second now', cs('a', 'background-color'), 'rgb(0, 0, 255)');
+    ok('the old second is not', cs('b', 'background-color'), 'rgba(0, 0, 0, 0)');
+    document.body.appendChild(el('p', 'p1'));
+  },
+  function () {
+    ok('the last p is bold', cs('p1', 'font-weight'), '700');
+    document.body.appendChild(el('p', 'p2'));
+  },
+  function () {
+    ok('a later p takes the last of its type', cs('p2', 'font-weight'), '700');
+    ok('from the one before', cs('p1', 'font-weight'), '400');
+    document.body.appendChild(el('div', 'h', { style: 'display:none' }));
+  },
+  function () {
+    ok('a hidden child counts as last', $('p2').offsetHeight, 20);
+    ok('and the one before it is second from the end', cs('p2', 'padding-left'), '7px');
+    document.body.appendChild(el('div', 's1', { 'class': 's' }));
+    document.body.appendChild(el('div', 't1', { 'class': 't' }));
+  },
+  function () {
+    ok("'+' reaches the child put in after", $('t1').offsetHeight, 31);
+    document.body.insertBefore(el('div', 'u1', { 'class': 'u' }), $('t1'));
+  },
+  function () {
+    ok("'~' reaches one put in further on", cs('u1', 'color'), 'rgb(0, 128, 0)');
+    ok("and '+' lets go of the one it no longer follows", $('t1').offsetHeight, 22);
+    document.body.removeChild($('u1'));
+  },
+  function () {
+    ok("one taken out: '+' reaches the one after it again", $('t1').offsetHeight, 31);
+    ok('and it is gone from the page', document.elementFromPoint(5, $('s1').offsetTop + 25) &&
+       document.elementFromPoint(5, $('s1').offsetTop + 25).id, 't1');
+    $('t1').remove();
+  },
+  function () {
+    ok('the last taken out: the one before is last now', $('s1').offsetHeight, 22);
+    document.body.removeChild($('z'));
+  },
+  function () {
+    ok('the first taken out: the next is first', cs('a', 'color'), 'rgb(255, 0, 0)');
+    ok('and at the top', $('a').offsetTop, 0);
+    ok('the third is second now', cs('b', 'background-color'), 'rgb(0, 0, 255)');
+    ok('and the second is not', cs('a', 'background-color'), 'rgba(0, 0, 0, 0)');
+    window.top_c = $('c').offsetTop;
+    window.top_p1 = $('p1').offsetTop;
+    document.body.replaceChild(el('div', 'r'), $('c'));
+  },
+  function () {
+    ok('a child replaced: the new one takes its place', $('r').offsetTop, window.top_c);
+    ok('and the old one leaves none', $('p1').offsetTop, window.top_p1);
+    ok('what is there is the new one', document.elementFromPoint(5, window.top_c + 5) &&
+       document.elementFromPoint(5, window.top_c + 5).id, 'r');
+    console.log('ordered-children: done');
+  }
+];
+addEventListener('load', function () {
+  var i = 0;
+  (function next() {
+    steps[i++]();
+    if (i < steps.length)
+      setTimeout(next, 120);
+  })();
+});
+</script></head>
+<body><div id="a">a</div></body></html>

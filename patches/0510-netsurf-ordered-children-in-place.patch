@@ -1,0 +1,720 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 25d209867..d2bb68e78 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -57,7 +57,7 @@ static css_error parent_node_cross(void *pw, void *node, void **parent);
+ static css_error part_host(void *pw, void *node, lwc_string *const *names,
+ 		uint32_t n_names, void *prev, void **host);
+ static css_error node_tree_scope(void *pw, void *node, void **scope);
+-static void note_order(void *pw, void *node, bool children);
++static void note_order(void *pw, void *node, unsigned what);
+ static void note_has(void *pw, void *node, bool siblings);
+ static css_error sibling_node(void *pw, void *node, void **sibling);
+ static css_error first_child_node(void *pw, void *node, void **child);
+@@ -1040,6 +1040,8 @@ static css_error node_tree_scope(void *pw, void *node, void **scope)
+  * :has() was tried on it, which reads its children too. */
+ #define MARK_ORDERED 1
+ #define MARK_HAS 2
++/* and what they read (VitaSurf): the NSCSS_ORDER_* bits, from here up */
++#define MARK_ORDER_SHIFT 2
+ 
+ /** Mark an element, adding to what it is marked with. */
+ static void mark_element(dom_node *n, uintptr_t bits)
+@@ -1054,34 +1056,44 @@ static void mark_element(dom_node *n, uintptr_t bits)
+ 			(void *) ((uintptr_t) old | bits), NULL, &old);
+ }
+ 
+-/** Mark an element whose children's order or presence a selector reads. */
+-static void mark_children_ordered(dom_node *n)
++/** Mark an element whose children's order or presence a selector
++ * reads, with what it read (NSCSS_ORDER_*). */
++static void mark_children_ordered(dom_node *n, unsigned what)
+ {
+-	mark_element(n, MARK_ORDERED);
++	mark_element(n, MARK_ORDERED | ((uintptr_t) what << MARK_ORDER_SHIFT));
+ }
+ 
+ /*
+  * A selector looked at a node's place among its siblings, or at its
+  * children (VitaSurf): the element whose children those are is marked,
+  * so that a child put into it or taken out is known to restyle more
+- * than itself (nscss_children_ordered). The mark stays with the element.
++ * than itself (nscss_children_ordered), and with which siblings a
++ * selector looked at (nscss_children_order). The mark stays with the
++ * element.
+  */
+-static void note_order(void *pw, void *node, bool children)
++static void note_order(void *pw, void *node, unsigned what)
+ {
+ 	dom_node *n = node, *parent = NULL;
+ 	dom_node_type type;
+ 
+ 	(void)pw;
+-	if (children) {
+-		mark_children_ordered(n);
++	if (what & CSS_ORDER_CHILDREN)
++		mark_children_ordered(n, NSCSS_ORDER_CHILDREN);
++	what &= ~(unsigned) CSS_ORDER_CHILDREN;
++	if (what == 0)
+ 		return;
+-	}
+ 	if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR ||
+ 			parent == NULL)
+ 		return;
+ 	if (dom_node_get_node_type(parent, &type) == DOM_NO_ERR &&
+ 			type == DOM_ELEMENT_NODE)
+-		mark_children_ordered(parent);
++		mark_children_ordered(parent,
++				((what & CSS_ORDER_PREV) ? NSCSS_ORDER_PREV : 0) |
++				((what & CSS_ORDER_PRECEDING) ?
++				 NSCSS_ORDER_PRECEDING : 0) |
++				((what & CSS_ORDER_NEXT) ? NSCSS_ORDER_NEXT : 0) |
++				((what & CSS_ORDER_FOLLOWING) ?
++				 NSCSS_ORDER_FOLLOWING : 0));
+ 	dom_node_unref(parent);
+ }
+ 
+@@ -1116,6 +1128,19 @@ bool nscss_has_subject(dom_node *n)
+ 			DOM_NO_ERR || ((uintptr_t) mark & MARK_HAS) != 0;
+ }
+ 
++/* exported function documented in css/select.h */
++unsigned nscss_children_order(dom_node *n)
++{
++	void *mark = NULL;
++
++	if (dom_node_get_user_data(n, corestring_dom___ns_key_children_ordered,
++			&mark) != DOM_NO_ERR)
++		return NSCSS_ORDER_ANY;
++	if (((uintptr_t) mark & MARK_HAS) != 0)
++		return NSCSS_ORDER_ANY;
++	return (unsigned) ((uintptr_t) mark >> MARK_ORDER_SHIFT);
++}
++
+ /* exported function documented in css/select.h */
+ bool nscss_children_ordered(dom_node *n)
+ {
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index c567238fc..807fc12c0 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -79,6 +79,22 @@ void nscss_clear_node_data(dom_node *n);
+  */
+ void *nscss_tree_scope(dom_node *n);
+ 
++/* What the selectors read of an element's children (VitaSurf): see
++ * nscss_children_order. */
++#define NSCSS_ORDER_CHILDREN 1   /* the element's own: :empty, :has() */
++#define NSCSS_ORDER_PREV 2       /* a child's previous sibling: '+', :first-* */
++#define NSCSS_ORDER_PRECEDING 4  /* any earlier: '~', :nth-child() */
++#define NSCSS_ORDER_NEXT 8       /* a child's next sibling: :last-* */
++#define NSCSS_ORDER_FOLLOWING 16 /* any later: :nth-last-child() */
++#define NSCSS_ORDER_ANY 31
++
++/**
++ * What the selectors that read the order or presence of an element's
++ * children read (VitaSurf): NSCSS_ORDER_* bits, 0 for nothing, and all
++ * of them when a :has() was tried on it or nothing can be told.
++ */
++unsigned nscss_children_order(dom_node *n);
++
+ /**
+  * Whether a selector has looked at the order of an element's children,
+  * or at whether it has any (VitaSurf): a sibling combinator, a
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index b4d3a5bae..a584a566b 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3259,6 +3259,21 @@ static bool show_after_plain(const css_computed_style *style)
+ 	return true;
+ }
+ 
++/** Whether a block's ::before or ::after style makes a box, as
++ * box_construct_generate decides: a rule such as `*, ::after` gives
++ * every element one with content normal, which makes nothing; Yahoo's
++ * body has one, and every block put into it had the page built again
++ * (VitaSurf). */
++static bool pseudo_generates(const css_computed_style *style)
++{
++	const css_computed_content_item *item = NULL;
++
++	return style != NULL &&
++			css_computed_content(style, &item) !=
++				CSS_CONTENT_NORMAL &&
++			ns_computed_display(style, false) != CSS_DISPLAY_NONE;
++}
++
+ /** Where an element's boxes go among its parent box pb's children:
+  * before the box of its next sibling with one, which has to be one of
+  * pb's own, or at the end (next_box NULL). False if neither will do:
+@@ -3315,8 +3330,8 @@ static bool show_place(html_content *c, dom_node *n, struct box *pb,
+ 			show_why = "inline content follows it";
+ 			return false;
+ 		}
+-	} else if (pb->styles != NULL &&
+-			pb->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL) {
++	} else if (pb->styles != NULL && pseudo_generates(
++			pb->styles->styles[CSS_PSEUDO_ELEMENT_AFTER])) {
+ 		/* before the parent's ::after, when that is a block of its
+ 		 * own at the end (a clearfix), showing nothing that counts:
+ 		 * the Guardian's page was built again when a hidden ad slot
+@@ -4018,6 +4033,34 @@ static struct content_html_object *rebuild_take_objects(html_content *c,
+ 	return taken;
+ }
+ 
++/** An element as the log names it, <TAG.first-class> (VitaSurf). */
++static void rebuild_label(dom_node *n, char *buf, size_t size)
++{
++	dom_string *name = NULL, *cls = NULL;
++	const char *c = "";
++	size_t k = 0, e;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR)
++		name = NULL;
++	if (dom_element_get_attribute(n, corestring_dom_class, &cls) !=
++			DOM_NO_ERR)
++		cls = NULL;
++	if (cls != NULL) {
++		c = dom_string_data(cls);
++		while (c[k] == ' ')
++			k++;
++	}
++	for (e = k; c[e] != '\0' && c[e] != ' '; e++)
++		;
++	snprintf(buf, size, "<%s%s%.*s>", name != NULL ?
++			dom_string_data(name) : "?", e > k ? "." : "",
++			(int) (e - k), c + k);
++	if (name != NULL)
++		dom_string_unref(name);
++	if (cls != NULL)
++		dom_string_unref(cls);
++}
++
+ /** How much box_rebuild_content may leave in a tree's context. */
+ #define BOX_REBUILT_LEFT_MAX (512 * 1024)
+ 
+@@ -4032,6 +4075,7 @@ enum box_restyle box_rebuild_content(html_content *c, dom_node *n,
+ 	dom_node_type type = DOM_ELEMENT_NODE;
+ 	unsigned depth, i, count = 0;
+ 	bool built, give_up = false;
++	char where[96];
+ 
+ 	if (!show_hide_allowed(c) || c->base.textsearch.context != NULL) {
+ 		restyle_why = "the page is busy";
+@@ -4078,6 +4122,9 @@ enum box_restyle box_rebuild_content(html_content *c, dom_node *n,
+ 		return BOX_RESTYLE_SAME;
+ 	}
+ 
++	/* where the change is, for the log (VitaSurf) */
++	rebuild_label(e, where, sizeof(where));
++
+ 	/* the nearest block around it that can be built on its own */
+ 	for (depth = 0; e != NULL && depth < 64 && !give_up; depth++) {
+ 		for (i = 0; i < *n_done; i++) {
+@@ -4103,9 +4150,13 @@ enum box_restyle box_rebuild_content(html_content *c, dom_node *n,
+ 	if (b == NULL) {
+ 		if (e != NULL)
+ 			dom_node_unref(e);
+-		if (!give_up)
+-			restyle_why = "no block around the change to build "
+-					"on its own";
++		if (!give_up) {
++			static char why[192];
++
++			snprintf(why, sizeof(why), "no block around the "
++				 "change in %.95s to build on its own", where);
++			restyle_why = why;
++		}
+ 		return BOX_RESTYLE_LAYOUT;
+ 	}
+ 
+@@ -4140,8 +4191,16 @@ enum box_restyle box_rebuild_content(html_content *c, dom_node *n,
+ 
+ 	nb = built ? box_for_node(e) : NULL;
+ 	if (nb == NULL) {
++		/* and why, from box_show_element (VitaSurf) */
++		static char why[384];
++		char what[96];
++
++		rebuild_label(e, what, sizeof(what));
++		snprintf(why, sizeof(why), "a block that could not be built "
++			 "again, %.95s around a change in %.95s (%.120s)",
++			 what, where, built ? "it has no box" : show_why);
+ 		dom_node_unref(e);
+-		restyle_why = "a block that could not be built again";
++		restyle_why = why;
+ 		return BOX_RESTYLE_LAYOUT;
+ 	}
+ 	/* what was put in may count, which the rest of the page sees */
+@@ -4768,12 +4827,14 @@ bool box_child_quiet(html_content *c, dom_node *e, dom_node *child)
+ 	bool in, none;
+ 
+ 	if (c->layout == NULL || box_for_node(e) == NULL ||
+-			nscss_children_ordered(e) ||
+ 			dom_node_get_node_type(child, &type) != DOM_NO_ERR)
+ 		return false;
++	/* no selector sees one, :empty included (VitaSurf) */
+ 	if (type == DOM_COMMENT_NODE ||
+ 			type == DOM_PROCESSING_INSTRUCTION_NODE)
+ 		return true;
++	if (nscss_children_ordered(e))
++		return false;
+ 	if (type != DOM_ELEMENT_NODE)
+ 		return false;
+ 
+@@ -4805,34 +4866,315 @@ bool box_child_quiet(html_content *c, dom_node *e, dom_node *child)
+ 	return none;
+ }
+ 
++/** Whether two elements have the same name, as the of-type tests ask. */
++static bool neighbour_same_type(dom_node *a, dom_string *name)
++{
++	dom_string *other = NULL;
++	bool same;
++
++	if (name == NULL || dom_node_get_node_name(a, &other) != DOM_NO_ERR ||
++			other == NULL)
++		return true;	/* nothing to tell: it might be */
++	same = dom_string_isequal(other, name);
++	dom_string_unref(other);
++	return same;
++}
++
++/** Restyle in place, with what is inside it, a sibling of a new child. */
++static enum box_restyle neighbour_restyle(html_content *c, dom_node *n,
++		unsigned *budget)
++{
++	enum box_restyle r;
++
++	if (*budget == 0)
++		return BOX_RESTYLE_LAYOUT;
++	r = box_restyle(c, n, true, budget);
++	if (r == BOX_RESTYLE_LAYOUT && *budget == 0)
++		restyle_why = "the siblings a selector reads are more than "
++				"may be restyled in place";
++	return r;
++}
++
++/**
++ * Restyle the siblings of a child put into e, or taken out of it, whose
++ * styles can depend on it (VitaSurf), by what the selectors read of e's
++ * children (nscss_children_order): a selector that reads an element's
++ * previous sibling ('+', :first-child, :first-of-type) reaches the next
++ * element and the next of the child's type, one that reads any earlier
++ * sibling ('~', :nth-child()) every later one; and the other way round
++ * for one that reads the next sibling (:last-child, :last-of-type) or
++ * any later one (:nth-last-child()). Any other element's style is as it
++ * was: a combinator only looks up and back, and the child's own style is
++ * new. A child put in at the end, under '+', '~', :first-child and
++ * :nth-child(), restyles nothing more.
++ *
++ * \param before  the sibling before the child's place, or NULL
++ * \param next    the sibling after it, or NULL
++ * \param name    the child's name, for the of-type tests, or NULL
++ */
++static enum box_restyle box_child_neighbours(html_content *c,
++		dom_node *before, dom_node *next, dom_string *name,
++		unsigned order)
++{
++	enum box_restyle res = BOX_RESTYLE_SAME, r;
++	unsigned budget = 2000;
++	dom_node *n, *sib;
++	int side;
++
++	for (side = 0; side < 2 && res != BOX_RESTYLE_LAYOUT; side++) {
++		/* the earlier siblings, then the later ones */
++		bool all = side == 0 ? (order & NSCSS_ORDER_FOLLOWING) != 0 :
++				(order & NSCSS_ORDER_PRECEDING) != 0;
++		bool near = side == 0 ? (order & NSCSS_ORDER_NEXT) != 0 :
++				(order & NSCSS_ORDER_PREV) != 0;
++		bool want_el = near, want_type = near;
++
++		if (!all && !near)
++			continue;
++		n = side == 0 ? before : next;
++		if (n != NULL)
++			dom_node_ref(n);
++		while (n != NULL && (all || want_el || want_type)) {
++			dom_node_type type;
++
++			if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++					type == DOM_ELEMENT_NODE && (all ||
++					want_el || (want_type &&
++					neighbour_same_type(n, name)))) {
++				if (!all) {
++					if (want_type && neighbour_same_type(n,
++							name))
++						want_type = false;
++					want_el = false;
++				}
++				r = neighbour_restyle(c, n, &budget);
++				if (r > res)
++					res = r;
++				if (res == BOX_RESTYLE_LAYOUT)
++					break;
++			}
++			sib = NULL;
++			if ((side == 0 ? dom_node_get_previous_sibling(n, &sib) :
++					dom_node_get_next_sibling(n, &sib)) !=
++					DOM_NO_ERR)
++				sib = NULL;
++			dom_node_unref(n);
++			n = sib;
++		}
++		if (n != NULL)
++			dom_node_unref(n);
++	}
++	return res;
++}
++
++/*
++ * The children of a batch whose siblings are still to restyle
++ * (VitaSurf): every child put in is built first, as a sibling's
++ * restyle would otherwise build one still waiting for its own turn.
++ * A child taken out keeps the sibling that followed it.
++ */
++#define NEIGHBOURS_MAX 16
++static struct {
++	dom_node *e, *child, *after;
++	unsigned order;
++	bool out;
++} neighbours[NEIGHBOURS_MAX];
++static unsigned n_neighbours;
++static bool neighbours_over;
++
++/** Whether n is a child of e. */
++static bool child_of(dom_node *n, dom_node *e)
++{
++	dom_node *p = NULL;
++	bool in;
++
++	if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++		return false;
++	in = p == e;
++	if (p != NULL)
++		dom_node_unref(p);
++	return in;
++}
++
++/** Restyle the siblings of one child of the batch at its place now. */
++static enum box_restyle box_child_settle_one(html_content *c, dom_node *e,
++		dom_node *child, dom_node *after, bool out, unsigned order)
++{
++	enum box_restyle res;
++	dom_string *name = NULL;
++	dom_node *before = NULL, *next = NULL;
++	dom_exception err;
++
++	if (out) {
++		/* taken out: its place is before after, which has to be
++		 * there still, or at the end */
++		if (child_of(child, e) ||
++				(after != NULL && !child_of(after, e))) {
++			restyle_why = "children taken out among siblings a "
++					"selector reads that moved again";
++			return BOX_RESTYLE_LAYOUT;
++		}
++		if (after != NULL) {
++			next = dom_node_ref(after);
++			err = dom_node_get_previous_sibling(after, &before);
++		} else {
++			err = dom_node_get_last_child(e, &before);
++		}
++	} else {
++		if (!child_of(child, e)) {
++			restyle_why = "children put in among siblings a "
++					"selector reads that moved again";
++			return BOX_RESTYLE_LAYOUT;
++		}
++		err = dom_node_get_previous_sibling(child, &before);
++		if (err == DOM_NO_ERR)
++			err = dom_node_get_next_sibling(child, &next);
++	}
++	if (err != DOM_NO_ERR) {
++		if (before != NULL)
++			dom_node_unref(before);
++		if (next != NULL)
++			dom_node_unref(next);
++		restyle_why = "the siblings of a child put in could not be "
++				"found";
++		return BOX_RESTYLE_LAYOUT;
++	}
++	if (dom_node_get_node_name(child, &name) != DOM_NO_ERR)
++		name = NULL;
++	res = box_child_neighbours(c, before, next, name, order);
++	if (name != NULL)
++		dom_string_unref(name);
++	if (before != NULL)
++		dom_node_unref(before);
++	if (next != NULL)
++		dom_node_unref(next);
++	return res;
++}
++
++/* exported interface documented in html/box_construct.h */
++enum box_restyle box_child_settle(html_content *c, bool discard)
++{
++	enum box_restyle res = BOX_RESTYLE_SAME, r;
++	unsigned i;
++
++	if (neighbours_over && !discard) {
++		restyle_why = "more children put in among siblings a selector "
++				"reads than may be restyled in place";
++		res = BOX_RESTYLE_LAYOUT;
++	}
++	for (i = 0; i < n_neighbours; i++) {
++		if (!discard && res != BOX_RESTYLE_LAYOUT) {
++			r = box_child_settle_one(c, neighbours[i].e,
++					neighbours[i].child,
++					neighbours[i].after,
++					neighbours[i].out,
++					neighbours[i].order);
++			if (r > res)
++				res = r;
++		}
++		dom_node_unref(neighbours[i].e);
++		dom_node_unref(neighbours[i].child);
++		if (neighbours[i].after != NULL)
++			dom_node_unref(neighbours[i].after);
++	}
++	n_neighbours = 0;
++	neighbours_over = false;
++	return res;
++}
++
++/** Their siblings restyled once the batch's children are built. */
++static void box_child_later(dom_node *e, dom_node *child, dom_node *after,
++		bool out, unsigned order)
++{
++	if (n_neighbours == NEIGHBOURS_MAX) {
++		neighbours_over = true;
++		return;
++	}
++	neighbours[n_neighbours].e = dom_node_ref(e);
++	neighbours[n_neighbours].child = dom_node_ref(child);
++	neighbours[n_neighbours].after = after != NULL ?
++			dom_node_ref(after) : NULL;
++	neighbours[n_neighbours].out = out;
++	neighbours[n_neighbours].order = order;
++	n_neighbours++;
++}
++
++/**
++ * A child taken out of e (VitaSurf): its boxes are taken out as an
++ * element's that has just been hidden, and its siblings at the place it
++ * was restyled once the batch is built. Every displayed block taken out
++ * of the body had the whole tree built again: a banner yahoo.com takes
++ * out of its body, and the old child of a replaceChild, whose boxes
++ * had stayed on the page.
++ */
++static bool box_child_taken(html_content *c, dom_node *e, dom_node *child,
++		dom_node *after, bool out, unsigned order,
++		enum box_restyle *result)
++{
++	struct box *b = box_for_node(child);
++	unsigned count = 0;
++
++	if (!out) {
++		/* put in and taken out again since the last layout:
++		 * nothing of it was drawn, and its siblings are as they
++		 * were */
++		if (b != NULL)
++			return false;
++		*result = BOX_RESTYLE_SAME;
++		return true;
++	}
++	if (after != NULL && !child_of(after, e))
++		return false;
++	*result = BOX_RESTYLE_SAME;
++	if (b != NULL) {
++		/* one of the element's own blocks, holding nothing that
++		 * counts for what follows */
++		if (b->parent != box_for_node(e))
++			return false;
++		if ((b->styles != NULL && rebuild_results_count(b->styles)) ||
++				(b->children != NULL &&
++				 rebuild_subtree_counts(b->children, &count))) {
++			restyle_why = "content taken out that counts or quotes";
++			*result = BOX_RESTYLE_LAYOUT;
++			return true;
++		}
++		if (!box_hide_element(c, b))
++			return false;
++		c->restyle_built = true;
++		*result = BOX_RESTYLE_REFLOW;
++	}
++	if (order != 0)
++		box_child_later(e, child, after, true, order);
++	return true;
++}
++
+ /* exported interface documented in html/box_construct.h */
+ bool box_child_build(html_content *c, dom_node *e, dom_node *child,
+-		enum box_restyle *result, dom_node **done, unsigned *n_done,
+-		unsigned max_done)
++		dom_node *after, bool out, enum box_restyle *result,
++		dom_node **done, unsigned *n_done, unsigned max_done)
+ {
+ 	struct box_construct_props props;
+ 	const css_computed_style *root_style, *style;
+ 	css_select_results *fresh;
+-	dom_node *parent = NULL;
+ 	dom_node_type type;
+ 	struct box *nb;
+-	unsigned count = 0;
+-	bool in, built;
++	unsigned count = 0, order;
++	bool built;
+ 
+ 	if (c->layout == NULL || box_for_node(e) == NULL ||
+-			nscss_children_ordered(e) ||
+ 			dom_node_get_node_type(child, &type) != DOM_NO_ERR ||
+ 			type != DOM_ELEMENT_NODE ||
+-			box_for_node(child) != NULL ||
+ 			!show_hide_allowed(c) ||
+ 			c->base.textsearch.context != NULL)
+ 		return false;
+-	if (dom_node_get_parent_node(child, &parent) != DOM_NO_ERR)
++	/* a selector that reads the element's own children, or a :has(),
++	 * may change more than siblings (VitaSurf) */
++	order = nscss_children_order(e);
++	if (order & NSCSS_ORDER_CHILDREN)
+ 		return false;
+-	in = parent == e;
+-	if (parent != NULL)
+-		dom_node_unref(parent);
+-	if (!in)
++	if (!child_of(child, e))
++		return box_child_taken(c, e, child, after, out, order, result);
++	if (box_for_node(child) != NULL)
+ 		return false;
+ 
+ 	box_extract_properties(c, child, &props);
+@@ -4848,7 +5190,12 @@ bool box_child_build(html_content *c, dom_node *e, dom_node *child,
+ 	if (style == NULL || ns_computed_display(style, false) ==
+ 			CSS_DISPLAY_NONE) {
+ 		css_select_results_destroy(fresh);
+-		return false;
++		if (style == NULL || order == 0)
++			return false;
++		/* not drawn, and only its siblings to restyle */
++		box_child_later(e, child, NULL, false, order);
++		*result = BOX_RESTYLE_SAME;
++		return true;
+ 	}
+ 	/* built as an element that has just been shown is: nothing is
+ 	 * changed when that cannot be done safely */
+@@ -4875,6 +5222,10 @@ bool box_child_build(html_content *c, dom_node *e, dom_node *child,
+ 	if (*n_done < max_done)
+ 		done[(*n_done)++] = dom_node_ref(child);
+ 	*result = BOX_RESTYLE_REFLOW;
++	/* and the siblings whose styles can depend on it, once the
++	 * batch's children are all built (VitaSurf) */
++	if (order != 0)
++		box_child_later(e, child, NULL, false, order);
+ 	return true;
+ }
+ 
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index 5ff6791c6..856c65f85 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -194,16 +194,32 @@ enum box_restyle {
+ bool box_child_quiet(struct html_content *c, struct dom_node *e,
+ 		struct dom_node *child);
+ 
++/**
++ * Restyle the siblings of the children box_child_build put in whose
++ * styles can depend on them (VitaSurf), once a batch's children are all
++ * built; or, with discard, only let go of them, when the batch builds
++ * the whole tree anyway.
++ */
++enum box_restyle box_child_settle(struct html_content *c, bool discard);
++
+ /**
+  * Build the boxes of an element child put into an element, on their own,
+  * as an element just shown is built (VitaSurf): an element added to the
+  * body had the whole tree built again, the body's children having no
+- * block of their own to build. Not when a selector has asked about the
+- * order or presence of the element's children (nscss_children_ordered).
++ * block of their own to build. Not when a selector has asked whether the
++ * element has children, or a :has() about them; the siblings whose
++ * styles a selector reads from the child are restyled once the batch is
++ * built (nscss_children_order, box_child_settle).
++ *
++ * A child taken out has its boxes taken out as an element hidden does,
++ * and the siblings at its place are restyled the same way.
+  *
+  * \param c         the document
+  * \param e         the element whose children changed
+- * \param child     the child put in
++ * \param child     the child put in or taken out
++ * \param after     for one taken out, the sibling that followed it
++ * \param out       whether child was e's child before the change, so
++ *                  that after says where it was
+  * \param result    what the page needs, when it returns true
+  * \param done      the blocks built in this batch (box_rebuild_content);
+  *                  the child is added when there is room
+@@ -212,8 +228,9 @@ bool box_child_quiet(struct html_content *c, struct dom_node *e,
+  * \return true if its boxes were built, false with nothing changed
+  */
+ bool box_child_build(struct html_content *c, struct dom_node *e,
+-		struct dom_node *child, enum box_restyle *result,
+-		struct dom_node **done, unsigned *n_done, unsigned max_done);
++		struct dom_node *child, struct dom_node *after, bool out,
++		enum box_restyle *result, struct dom_node **done,
++		unsigned *n_done, unsigned max_done);
+ 
+ /**
+  * Build again the boxes around a text node whose text a script changed,
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 564df5dab..627029bb8 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -5364,8 +5364,13 @@ bool html_restyle_attrs(html_content *c,
+ 			/* an element put in, built on its own as one shown
+ 			 * is (VitaSurf) */
+ 			if (ch->child != NULL && box_child_build(c, ch->node,
+-					ch->child, &r, built, &n_built,
++					ch->child, ch->after, ch->out, &r,
++					built, &n_built,
+ 					sizeof(built) / sizeof(built[0]))) {
++				/* one not drawn still loads its frames */
++				if (!frames && html_subtree_has_iframe(
++						ch->child))
++					frames = true;
+ 				if (r > res)
+ 					res = r;
+ 				if (res == BOX_RESTYLE_LAYOUT)
+@@ -5651,6 +5656,14 @@ bool html_restyle_attrs(html_content *c,
+ 		if (now != NULL)
+ 			dom_string_unref(now);
+ 	}
++	/* the siblings of the children put in, now they are all built
++	 * (VitaSurf) */
++	r = box_child_settle(c, res == BOX_RESTYLE_LAYOUT);
++	if (res != BOX_RESTYLE_LAYOUT && r > res) {
++		res = r;
++		if (res == BOX_RESTYLE_LAYOUT)
++			ATTR_WHY("new content: %s", box_restyle_why());
++	}
+ #undef ATTR_WHY
+ 	while (n_built > 0)
+ 		dom_node_unref(built[--n_built]);
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index a4774a85f..be16d06b4 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -669,6 +669,12 @@ struct html_attr_change {
+ 	/** for new children, the one child put in or taken out, when it
+ 	 * is one, or NULL (VitaSurf) */
+ 	struct dom_node *child;
++	/** for a child taken out of node, the sibling that followed it
++	 * then, or NULL if it was the last (VitaSurf) */
++	struct dom_node *after;
++	/** whether child was among node's children when the first change
++	 * since the last layout was noted, so after says where (VitaSurf) */
++	bool out;
+ };
+ 
+ /**
