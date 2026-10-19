@@ -1,0 +1,220 @@
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index ffad0a36d..d42709844 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -1080,8 +1080,11 @@ exec_src_script(html_content *c,
+ 
+ 	nscript->asked = nsurl_ref(joined);
+ 	nscript->node = dom_node_ref(node);
++	/* a module must be sent as JavaScript, a classic script need not
++	 * (VitaSurf) */
+ 	ns_error = hlcache_handle_retrieve(joined,
+-					   0,
++					   script_type_is_module(mimetype) ? 0 :
++					   HLCACHE_RETRIEVE_CLASSIC_SCRIPT,
+ 					   content_get_url(&c->base),
+ 					   NULL,
+ 					   script_cb,
+diff --git a/content/hlcache.c b/content/hlcache.c
+index 94eae8eb2..de2dff32e 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -22,8 +22,10 @@
+  */
+ 
+ #include <assert.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "utils/http.h"
+ #include "utils/log.h"
+@@ -409,14 +411,85 @@ static nserror hlcache_find_content(hlcache_retrieval_ctx *ctx,
+  *         NSERROR_NEED_DATA on success where data is needed,
+  *         appropriate error otherwise
+  */
++/**
++ * Whether a classic script sent as type may run (VitaSurf): the Fetch
++ * standard blocks one sent as an image, audio, video or CSV type, and
++ * with "X-Content-Type-Options: nosniff" any type but JavaScript's;
++ * whatever else it is sent as, or nothing, it runs. NetSurf had run
++ * text/javascript and application/javascript alone, so a server that
++ * sent a script as text/plain or application/octet-stream left the
++ * page without it.
++ */
++static bool hlcache_classic_script_runs(hlcache_retrieval_ctx *ctx,
++		lwc_string *type)
++{
++	const char *t = type != NULL ? lwc_string_data(type) : "";
++	const char *nosniff = llcache_handle_get_header(ctx->llcache,
++			"X-Content-Type-Options");
++
++	if (strncasecmp(t, "image/", 6) == 0 ||
++			strncasecmp(t, "audio/", 6) == 0 ||
++			strncasecmp(t, "video/", 6) == 0 ||
++			strcasecmp(t, "text/csv") == 0)
++		return false;
++	if (nosniff != NULL) {
++		while (*nosniff == ' ' || *nosniff == '\t')
++			nosniff++;
++		if (strncasecmp(nosniff, "nosniff", 7) == 0 &&
++				(nosniff[7] == '\0' || nosniff[7] == ',' ||
++				 nosniff[7] == ' ' || nosniff[7] == ';'))
++			return false;
++	}
++	return true;
++}
++
+ static nserror hlcache_migrate_ctx(hlcache_retrieval_ctx *ctx,
+ 		lwc_string *effective_type)
+ {
+ 	content_type type = CONTENT_NONE;
+ 	nserror error = NSERROR_OK;
++	lwc_string *as_script = NULL;
+ 
+ 	ctx->migrate_target = true;
+ 
++	/* a script whose answer is not a success has nothing to run, and
++	 * its element is told error: a 404 page had been run as script,
++	 * or refused only for being HTML (VitaSurf) */
++	if (ctx->accepted_types == CONTENT_SCRIPT) {
++		long code = llcache_handle_get_http_code(ctx->llcache);
++
++		if (code != 0 && (code < 200 || code > 299)) {
++			if (ctx->handle->cb != NULL) {
++				hlcache_event hlevent;
++				static char why[48];
++
++				snprintf(why, sizeof(why),
++					 "the server answered %ld", code);
++				hlevent.type = CONTENT_MSG_ERROR;
++				hlevent.data.errordata.errorcode =
++						NSERROR_NOT_FOUND;
++				hlevent.data.errordata.errormsg = why;
++				ctx->handle->cb(ctx->handle, &hlevent,
++						ctx->handle->pw);
++			}
++			llcache_handle_abort(ctx->llcache);
++			llcache_handle_release(ctx->llcache);
++			goto done;
++		}
++	}
++
++	/* a classic script sent as something else is still one */
++	if ((ctx->flags & HLCACHE_RETRIEVE_CLASSIC_SCRIPT) &&
++			(effective_type == NULL ||
++			 !hlcache_type_is_acceptable(effective_type,
++					ctx->accepted_types, &type)) &&
++			hlcache_classic_script_runs(ctx, effective_type) &&
++			lwc_intern_string("text/javascript", 15,
++					&as_script) == lwc_error_ok) {
++		effective_type = as_script;
++		type = CONTENT_NONE;
++	}
++
+ 	if ((effective_type != NULL) &&
+ 	    hlcache_type_is_acceptable(effective_type,
+ 				       ctx->accepted_types,
+@@ -471,7 +544,10 @@ static nserror hlcache_migrate_ctx(hlcache_retrieval_ctx *ctx,
+ 		llcache_handle_release(ctx->llcache);
+ 	}
+ 
++done:
+ 	ctx->migrate_target = false;
++	if (as_script != NULL)
++		lwc_string_unref(as_script);
+ 
+ 	/* No longer require retrieval context */
+ 	RING_REMOVE(hlcache->retrieval_ctx_ring, ctx);
+diff --git a/content/hlcache.h b/content/hlcache.h
+index fc6ce0d11..c5580debc 100644
+--- a/content/hlcache.h
++++ b/content/hlcache.h
+@@ -92,7 +92,11 @@ enum hlcache_retrieve_flag {
+ 	/** It's permitted to convert this request into a download */
+ 	HLCACHE_RETRIEVE_MAY_DOWNLOAD = (1 << 31),
+ 	/* Permit content-type sniffing */
+-	HLCACHE_RETRIEVE_SNIFF_TYPE   = (1 << 30)
++	HLCACHE_RETRIEVE_SNIFF_TYPE   = (1 << 30),
++	/** A classic script, which runs whatever type it is sent as but
++	 * an image, audio, video or CSV one, unless the response says
++	 * nosniff (VitaSurf) */
++	HLCACHE_RETRIEVE_CLASSIC_SCRIPT = (1 << 29)
+ };
+ 
+ /**
+diff --git a/content/llcache.c b/content/llcache.c
+index d989f4c46..c46ee70ff 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -208,6 +208,9 @@ struct llcache_object {
+ 	nsurl *preload_url;
+ 	/** The fetch failed or was cut short: nobody may join it */
+ 	bool failed;
++	/** The response's HTTP status, or 0 when there was none, or the
++	 * object came from the cache (VitaSurf) */
++	long http_code;
+ 
+ 	/* Instrumentation. These elements are strictly for information
+ 	 * to improve the cache performance and to provide performance
+@@ -2723,6 +2726,7 @@ llcache_fetch_process_data(llcache_object *object,
+ 		 */
+ 		long http_code = fetch_http_code(object->fetch.fetch);
+ 
++		object->http_code = http_code;	/* VitaSurf */
+ 		if ((http_code != 200 && http_code != 203) ||
+ 		    (nsurl_has_component(object->url, NSURL_QUERY) &&
+ 		     (object->cache.max_age == INVALID_AGE &&
+@@ -3326,6 +3330,10 @@ static void llcache_fetch_callback(const fetch_msg *msg, void *p)
+ 				(int) fetch_http_code(object->fetch.fetch) : 0);
+ 		vitasurf_timeline_end(object->fetch.timeline_slot,
+ 				VITASURF_FETCH_DONE);
++		/* the status, which the fetch keeps until now (VitaSurf) */
++		if (object->fetch.fetch != NULL)
++			object->http_code = fetch_http_code(
++					object->fetch.fetch);
+ 		object->fetch.fetch = NULL;
+ 
+ 		/* Shrink source buffer to required size */
+@@ -4570,6 +4578,20 @@ const uint8_t *llcache_handle_get_source_data(const llcache_handle *handle,
+ }
+ 
+ /* See llcache.h for documentation */
++/* exported interface documented in content/llcache.h (VitaSurf) */
++long llcache_handle_get_http_code(const llcache_handle *handle)
++{
++	const llcache_object *object = handle->object;
++
++	if (object == NULL)
++		return 0;
++	/* the fetch has it once its headers are in, before any data */
++	if (object->fetch.fetch != NULL &&
++			fetch_http_code(object->fetch.fetch) != 0)
++		return fetch_http_code(object->fetch.fetch);
++	return object->http_code;
++}
++
+ const char *llcache_handle_get_header(const llcache_handle *handle,
+ 		const char *key)
+ {
+diff --git a/content/llcache.h b/content/llcache.h
+index ae8dfa226..2aa67de10 100644
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -322,6 +322,15 @@ const uint8_t *llcache_handle_get_source_data(const llcache_handle *handle,
+  *       key-value pairs for any additional parameters.
+  * \todo Deal with multiple headers of the same key (e.g. Set-Cookie)
+  */
++/**
++ * The HTTP status of an object's response (VitaSurf).
++ *
++ * \param handle  Handle to the object
++ * \return the status, or 0 when there was none (another scheme, or the
++ *         object came from the cache, which keeps only 200 and 203)
++ */
++long llcache_handle_get_http_code(const llcache_handle *handle);
++
+ const char *llcache_handle_get_header(const llcache_handle *handle,
+ 		const char *key);
+ 
