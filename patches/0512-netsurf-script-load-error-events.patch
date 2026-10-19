@@ -1,0 +1,248 @@
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index edc8638c2..08d057493 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -101,6 +101,9 @@ struct html_script {
+ 	/** the URL asked for, which a redirect makes differ from the
+ 	 * handle's; NULL for inline scripts (VitaSurf) */
+ 	struct nsurl *asked;
++	/** the element, for its load and error events; NULL for inline
++	 * scripts, which have neither (VitaSurf) */
++	struct dom_node *node;
+ 	bool already_started;
+ 	/** whether the log has said this one was dropped (VitaSurf) */
+ 	bool reported;
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 0e320d51a..ffad0a36d 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -51,6 +51,8 @@
+ 
+ typedef bool (script_handler_t)(struct jsthread *jsthread, const uint8_t *data, size_t size, const char *name);
+ 
++static void script_loaded(html_content *c, unsigned int i);
++
+ 
+ /**
+  * Whether a script element's type is "module" (VitaSurf). The engine is
+@@ -143,7 +145,8 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 				s = &(c->scripts[i]);
+ 
+ 				s->already_started = true;
+-
++				script_loaded(c, i);
++				s = &(c->scripts[i]);
+ 			}
+ 		}
+ 	}
+@@ -204,6 +207,7 @@ html_process_new_script(html_content *c,
+ 	 */
+ 	memset(&nscript->data, 0, sizeof(nscript->data));
+ 	nscript->asked = NULL;
++	nscript->node = NULL;
+ 
+ 	nscript->mimetype = dom_string_ref(mimetype); /* reference mimetype */
+ 
+@@ -211,6 +215,113 @@ html_process_new_script(html_content *c,
+ }
+ 
+ 
++/*
++ * A script element's load and error events (VitaSurf). NetSurf sent
++ * neither, so a loader that waits for a script's load (next/script's
++ * onLoad, a loadScript() promise, a polyfill loader) waited for good,
++ * and one that reports a failed script never heard of it. load is sent
++ * once the script has run, as the HTML standard's "execute the script
++ * element" does; error when its fetch fails, from a task of its own, as
++ * the failure can come back inside the fetch call, with the element
++ * still being put in. A script whose src is a Blob the page made, which
++ * nothing fetches, runs from a task the same way, from the text the
++ * page holds (js_exec_local), and had been dropped without either.
++ */
++struct script_error_task {
++	struct script_error_task *next;
++	html_content *c;
++	dom_node *node;
++	char *blob;		/* the Blob's address to run, or NULL */
++	bool module;
++};
++static struct script_error_task *script_errors;
++static struct script_error_task **script_errors_tail = &script_errors;
++
++static void script_errors_run(void *p)
++{
++	struct script_error_task *t;
++
++	(void) p;
++	while ((t = script_errors) != NULL) {
++		script_errors = t->next;
++		if (script_errors == NULL)
++			script_errors_tail = &script_errors;
++		if (t->c->jsthread != NULL && !t->c->aborted) {
++			bool ran = false;
++
++			if (t->blob != NULL) {
++				vitasurf_js_module_hint = t->module;
++				ran = js_exec_local(t->c->jsthread, t->blob);
++				vitasurf_js_module_hint = false;
++				if (!ran)
++					vita_log("script: %s is no Blob this "
++						 "page holds", t->blob);
++			}
++			fire_generic_dom_event(ran ? corestring_dom_load :
++					corestring_dom_error, t->node,
++					false, false);
++		}
++		dom_node_unref(t->node);
++		free(t->blob);
++		free(t);
++	}
++}
++
++/** Send error to a script element whose fetch failed, from a task; or
++ * with blob, run the Blob of that address and send load. */
++static void script_task_soon(html_content *c, dom_node *node,
++		const char *blob, bool module)
++{
++	struct script_error_task *t;
++
++	if (node == NULL || (t = malloc(sizeof(*t))) == NULL)
++		return;
++	t->next = NULL;
++	t->c = c;
++	t->node = dom_node_ref(node);
++	t->blob = blob != NULL ? strdup(blob) : NULL;
++	t->module = module;
++	*script_errors_tail = t;
++	script_errors_tail = &t->next;
++	guit->misc->schedule(0, script_errors_run, NULL);
++}
++
++/** Forget the error events of a document going away. */
++static void script_errors_drop(html_content *c)
++{
++	struct script_error_task **pt = &script_errors, *t;
++
++	while ((t = *pt) != NULL) {
++		if (t->c == c) {
++			*pt = t->next;
++			dom_node_unref(t->node);
++			free(t->blob);
++			free(t);
++			continue;
++		}
++		pt = &t->next;
++	}
++	script_errors_tail = pt;
++}
++
++static void script_error_soon(html_content *c, dom_node *node)
++{
++	script_task_soon(c, node, NULL, false);
++}
++
++/** Send load to the external script c->scripts[i], which has just run:
++ * what it sets off may add scripts, which moves the array. */
++static void script_loaded(html_content *c, unsigned int i)
++{
++	dom_node *node = c->scripts[i].node;
++
++	if (node == NULL || c->jsthread == NULL)
++		return;
++	dom_node_ref(node);
++	fire_generic_dom_event(corestring_dom_load, node, false, false);
++	dom_node_unref(node);
++}
++
+ /*
+  * A script fetch that finishes after the page was laid out was the last
+  * thing the page was waiting for (VitaSurf). The callbacks below only
+@@ -607,6 +718,7 @@ convert_script_async_cb(hlcache_handle *script,
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+ 		parent->base.active--;
++		script_error_soon(parent, s->node);
+ 		NSLOG(netsurf, INFO, "%d fetches active", parent->base.active);
+ 
+ 		break;
+@@ -692,6 +804,7 @@ convert_script_defer_cb(hlcache_handle *script,
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+ 		parent->base.active--;
++		script_error_soon(parent, s->node);
+ 		NSLOG(netsurf, INFO, "%d fetches active", parent->base.active);
+ 
+ 		break;
+@@ -765,6 +878,8 @@ convert_script_sync_cb(hlcache_handle *script,
+ 				       nsurl_access(hlcache_handle_get_url(s->data.handle)));
+ 			vitasurf_js_module_hint = false;
+ 			parent->script_depth--;
++			script_loaded(parent, i);
++			s = &parent->scripts[i];
+ 		} else {
+ 			/*
+ 			 * It arrived and was then dropped, without a word:
+@@ -825,6 +940,7 @@ convert_script_sync_cb(hlcache_handle *script,
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+ 		parent->base.active--;
++		script_error_soon(parent, s->node);
+ 
+ 		NSLOG(netsurf, INFO, "%d fetches active", parent->base.active);
+ 
+@@ -963,6 +1079,7 @@ exec_src_script(html_content *c,
+ 	child.quirks = c->base.quirks;
+ 
+ 	nscript->asked = nsurl_ref(joined);
++	nscript->node = dom_node_ref(node);
+ 	ns_error = hlcache_handle_retrieve(joined,
+ 					   0,
+ 					   content_get_url(&c->base),
+@@ -985,7 +1102,13 @@ exec_src_script(html_content *c,
+ 		 * fetch never became active
+ 		 */
+ 		/* mark duff script fetch as already started */
++		nscript = &c->scripts[script_idx];
+ 		nscript->already_started = true;
++		if (strncasecmp(nsurl_access(nscript->asked), "blob:", 5) == 0)
++			script_task_soon(c, node, nsurl_access(nscript->asked),
++					script_type_is_module(mimetype));
++		else
++			script_error_soon(c, node);
+ 		NSLOG(netsurf, INFO, "Fetch failed with error %d", ns_error);
+ 	} else {
+ 		/* update base content active fetch count */
+@@ -1445,10 +1568,14 @@ nserror html_script_free(html_content *html)
+ 		html->blocked_script = NULL;
+ 	}
+ 
++	script_errors_drop(html);
+ 	for (i = 0; i != html->scripts_count; i++) {
+ 		if (html->scripts[i].asked != NULL) {
+ 			nsurl_unref(html->scripts[i].asked);
+ 		}
++		if (html->scripts[i].node != NULL) {
++			dom_node_unref(html->scripts[i].node);
++		}
+ 		if (html->scripts[i].mimetype != NULL) {
+ 			dom_string_unref(html->scripts[i].mimetype);
+ 		}
+diff --git a/content/handlers/javascript/js.h b/content/handlers/javascript/js.h
+index c7884fd94..a3f03df86 100644
+--- a/content/handlers/javascript/js.h
++++ b/content/handlers/javascript/js.h
+@@ -129,6 +129,14 @@ void js_destroythread(jsthread *thread);
+  */
+ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name);
+ 
++/**
++ * Run a script whose text the page itself holds (VitaSurf): the address
++ * of a Blob the page made, which nothing can fetch.
++ *
++ * \return true if it had the text and ran it, false if it has none.
++ */
++bool js_exec_local(jsthread *thread, const char *url);
++
+ /**
+  * fire an event at a dom node
+  */

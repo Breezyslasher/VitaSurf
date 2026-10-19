@@ -24408,6 +24408,51 @@ static JSValue heap_script_keep(jsthread *thread, const char *url,
 	return run;
 }
 
+/* exported interface documented in js.h (VitaSurf) */
+bool js_exec_local(jsthread *thread, const char *url)
+{
+	JSContext *ctx;
+	JSValue global, get, text = JS_UNDEFINED;
+	const char *src;
+	size_t len;
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL) {
+		return false;
+	}
+	ctx = thread->ctx;
+	global = JS_GetGlobalObject(ctx);
+	get = natives_get(ctx, "__vitaLocalModule");
+	if (JS_IsFunction(ctx, get)) {
+		JSValue arg = JS_NewString(ctx, url);
+
+		text = JS_Call(ctx, get, global, 1, &arg);
+		JS_FreeValue(ctx, arg);
+	}
+	JS_FreeValue(ctx, get);
+	JS_FreeValue(ctx, global);
+	if (JS_IsException(text)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return false;
+	}
+	if (!JS_IsString(text)) {
+		JS_FreeValue(ctx, text);
+		return false;
+	}
+	src = JS_ToCStringLen(ctx, &len, text);
+	JS_FreeValue(ctx, text);
+	if (src == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return false;
+	}
+	/* it ran whatever came of it, as a fetched script that throws
+	 * has; an empty Blob is a script with nothing in it */
+	if (len > 0) {
+		(void)js_exec(thread, (const uint8_t *)src, len, url);
+	}
+	JS_FreeCString(ctx, src);
+	return true;
+}
+
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name)
 {
 	JSValue ret;

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<!--
+  A script element's load and error events (VitaSurf). NetSurf sent
+  neither: a script put in by script never told its onload, or a
+  listener, that it had run, and one whose fetch failed never said so,
+  so a loader waiting on either waited for good. load comes once the
+  script has run, and does not bubble; error comes when the fetch fails;
+  an inline script has neither. A script from a Blob the page made had
+  not run at all. Each line must say PASS; Chrome passes
+  them all.
+-->
+<html><head><meta charset="utf-8"><title>Script load events</title>
+<script>
+var log = [], bubbled = 0;
+document.documentElement.addEventListener('load', function () { bubbled++; });
+</script>
+<script id="parsed" src="resources/counted-script.js" onload="log.push('parsed load ' + window.runs)"></script>
+<script id="parsed-missing" src="resources/no-such-script.js" onerror="log.push('parsed error')"></script>
+<script id="inline" onload="log.push('inline load')">window.inlineRan = true;</script>
+</head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) {
+  var l = (got === want ? 'PASS ' : 'FAIL ') + name +
+    (got === want ? '' : ': ' + got + ', want ' + want);
+  out.push(l); console.log('script-load-events: ' + l);
+}
+function add(src, attrs) {
+  var s = document.createElement('script');
+  for (var k in attrs || {}) s.setAttribute(k, attrs[k]);
+  s.src = src;
+  document.head.appendChild(s);
+  return s;
+}
+var steps = [
+  function () {
+    ok('a parsed script tells its onload, after it ran', log.indexOf('parsed load 1') >= 0, true);
+    ok('a parsed script that is not there says error', log.indexOf('parsed error') >= 0, true);
+    ok('an inline script has no load', log.indexOf('inline load') < 0 && window.inlineRan === true, true);
+    var s = add('resources/counted-script.js?2', { id: 'added' });
+    s.onload = function (e) {
+      log.push('added onload ' + window.runs + ' ' + e.type + ' ' + e.bubbles + ' ' +
+               (e.target === s) + ' ' + e.isTrusted);
+    };
+    s.addEventListener('load', function () { log.push('added listener'); });
+    var m = add('resources/no-such-script.js?2', { id: 'added-missing' });
+    m.onerror = function (e) { log.push('added error ' + e.type + ' ' + (e.target === m)); };
+    m.onload = function () { log.push('added missing load'); };
+    var d = document.createElement('script');
+    d.src = 'data:text/javascript,window.dataRan=1';
+    d.addEventListener('load', function () { log.push('data load ' + window.dataRan); });
+    document.body.appendChild(d);
+    var mod = add('resources/counted-module.js', { type: 'module' });
+    mod.onload = function () { log.push('module load ' + window.moduleRan); };
+    var bu = URL.createObjectURL(new Blob(['window.blobRan = (window.blobRan || 0) + 1;'],
+                                          { type: 'text/javascript' }));
+    var bs = add(bu);
+    bs.onload = function () { log.push('blob load ' + window.blobRan); };
+    var gone = URL.createObjectURL(new Blob(['window.goneRan = 1;']));
+    URL.revokeObjectURL(gone);
+    var gs = add(gone);
+    gs.onerror = function () { log.push('revoked error'); };
+    gs.onload = function () { log.push('revoked load'); };
+  },
+  function () {
+    ok('one put in by script tells its onload once it ran',
+       log.indexOf('added onload 2 load false true true') >= 0, true);
+    ok('and its listeners', log.indexOf('added listener') >= 0, true);
+    ok('one that is not there says error',
+       log.indexOf('added error error true') >= 0, true);
+    ok('and not load', log.indexOf('added missing load') < 0, true);
+    ok('a data: script tells its listener', log.indexOf('data load 1') >= 0, true);
+    ok('a module script its onload', log.indexOf('module load 1') >= 0, true);
+    ok('a script from a Blob runs and tells its onload', log.indexOf('blob load 1') >= 0, true);
+    ok('one from a Blob let go of says error', log.indexOf('revoked error') >= 0 &&
+       log.indexOf('revoked load') < 0 && window.goneRan === undefined, true);
+    ok('load does not bubble', bubbled, 0);
+    ok('each ran once', window.runs, 2);
+    document.getElementById('out').textContent = out.join('\n');
+    console.log('script-load-events: done');
+  }
+];
+/* the second step once what the first set off has all come, or 5 s */
+function settled() {
+  return ['added onload', 'added listener', 'added error', 'data load',
+          'module load', 'blob load', 'revoked error'].every(function (p) {
+    return log.some(function (l) { return l.indexOf(p) === 0; });
+  });
+}
+addEventListener('load', function () {
+  var t0 = Date.now();
+  steps[0]();
+  (function wait() {
+    if (settled() || Date.now() - t0 > 5000)
+      setTimeout(steps[1], 50);
+    else
+      setTimeout(wait, 50);
+  })();
+});
+</script>
+</body></html>
