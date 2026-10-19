@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<!--
+  One large script run in several realms of a runtime (VitaSurf): the
+  page and two frames run the same 40 KB script from the same address,
+  which is compiled once and run in each realm as a clone of that
+  compile (heap_script_take). Each must see only its own globals, its
+  own prototypes and its own closures, its functions compiled in its
+  own realm when first called; a function of one realm called from
+  another still runs in its own. The log must say the second and third
+  were "taken from an earlier compile"; each line must say PASS, as in
+  Chrome.
+-->
+<html><head><meta charset="utf-8"><title>One compile, three realms</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) {
+  var l = (got === want ? 'PASS ' : 'FAIL ') + name +
+    (got === want ? '' : ': ' + got + ', want ' + want);
+  out.push(l); console.log('shared-compile: ' + l);
+}
+/* the script: a counter in a closure, functions that make objects of
+   their realm, a tagged template inside a function, and 400 functions
+   never called, so that it is big enough to be kept */
+var SRC = [
+  'var shared = { realm: location.href, made: [] };',
+  'var count = 0;',
+  'function bump() { return ++count; }',
+  'function makeArray() { return [1, 2, 3]; }',
+  'function makeObject() { return { a: 1 }; }',
+  'function tag(s) { return s; }',
+  /* long enough to be compiled when first called, as most functions
+     are: its template object is then made in each realm */
+  'function tagged() { var unused = "a string to make it long enough to wait for its first call, past the length below which a function is compiled at once"; return tag`x${1}y`; }',
+  'function stack() { try { null.x; } catch (e) { return e instanceof TypeError; } }',
+  'var later = (function () { var hidden = 41; return function () { return ++hidden; }; })();',
+  'var Shape = class Shape { constructor(n) { this.n = n; } get twice() { return this.n * 2; } };',
+  'function source() { return bump.toString(); }'
+];
+for (var i = 0; i < 400; i++)
+  SRC.push('function unused' + i + '(a, b) { var t = a + b * ' + i +
+           '; for (var k = 0; k < t; k++) { t -= k; } return [t, "' +
+           'padding padding padding padding"]; }');
+/* it says when it has run */
+SRC.push('top.step();');
+var URL_ = 'data:text/javascript,' + encodeURIComponent(SRC.join('\n'));
+function load(win) {
+  var s = win.document.createElement('script');
+  s.src = URL_;
+  win.document.head.appendChild(s);
+}
+var frames_ = [], ready = 0;
+function frame(id) {
+  var f = document.createElement('iframe');
+  f.id = id;
+  f.srcdoc = '<!DOCTYPE html><head></head><body>' + id + '</body>';
+  f.onload = function () { load(f.contentWindow); };
+  document.body.appendChild(f);
+  frames_.push(f);
+}
+function step() {
+  if (++ready === 1) {
+    /* the page's has run: the frames next */
+    frame('f1');
+    frame('f2');
+  }
+  if (ready < 3) return;
+  var a = frames_[0].contentWindow, b = frames_[1].contentWindow;
+  ok('the page ran it', typeof window.bump, 'function');
+  ok('each frame ran it', typeof a.bump + ' ' + typeof b.bump, 'function function');
+  ok('each realm has its own functions', a.bump !== b.bump && a.bump !== window.bump, true);
+  ok('and its own globals', a.shared !== b.shared, true);
+  a.bump(); a.bump();
+  ok('a closure counts in its own realm', a.bump() + ',' + b.bump() + ',' + window.bump(), '3,1,1');
+  ok('the page\'s count is its own', window.count + ',' + a.count + ',' + b.count, '1,3,1');
+  ok('an array made there is of that realm', a.makeArray() instanceof a.Array &&
+     !(a.makeArray() instanceof Array) && b.makeArray() instanceof b.Array, true);
+  ok('so is an object', Object.getPrototypeOf(b.makeObject()) === b.Object.prototype, true);
+  ok('an error thrown there is of that realm', a.stack() && b.stack(), true);
+  var t1 = a.tagged(), t2 = a.tagged(), t3 = b.tagged();
+  ok('a tagged template is one object in a realm', t1 === t2, true);
+  ok('and another in each realm', t1 !== t3 && Object.getPrototypeOf(t3) === b.Array.prototype, true);
+  ok('its strings', t3.join('|') + ' ' + t3.raw.join('|'), 'x|y x|y');
+  ok('a closure made as it ran keeps its own state', a.later() + ',' + a.later() + ',' + b.later(), '42,43,42');
+  var s = new b.Shape(4);
+  ok('a class is of its realm', s instanceof b.Shape && !(s instanceof a.Shape) &&
+     Object.getPrototypeOf(b.Shape.prototype) === b.Object.prototype, true);
+  ok('its getter', s.twice, 8);
+  ok('a function\'s text is its source', a.source(), 'function bump() { return ++count; }');
+  ok('a function called from another realm runs in its own',
+     a.makeArray.call(window) instanceof a.Array, true);
+  ok('one never called still works in each', a.unused3(1, 2)[1] === b.unused3(1, 2)[1] &&
+     a.unused3(1, 2) instanceof a.Array, true);
+  ok('the realms\' addresses', a.shared.realm === 'about:srcdoc' && window.shared.realm === location.href, true);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('shared-compile: done');
+}
+addEventListener('load', function () { load(window); });
+</script>
+</body></html>

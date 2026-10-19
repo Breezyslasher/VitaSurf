@@ -101,6 +101,22 @@
 /* the prelude and its four units */
 #define HEAP_TEMPLATES 5
 
+/* a script compiled in one of a runtime's realms, kept for the others */
+struct heap_script {
+	char *url;
+	uint64_t hash;
+	uint32_t len;
+	uint32_t stamp;		/* when last taken, for the oldest to go */
+	JSValue tmpl;
+};
+#define HEAP_SCRIPTS 16
+/* smaller ones compile in a few ms */
+#define HEAP_SCRIPT_MIN (16u * 1024)
+/* the source the kept scripts may hold, which is most of their size:
+ * a lazily compiled script's functions are only what making them needs
+ * until each is called */
+#define HEAP_SCRIPT_BUDGET (3u * 1024 * 1024)
+
 struct jsheap {
 	JSRuntime *rt;
 	struct qjs_pool *pool;  /**< the runtime's small-block allocator */
@@ -131,6 +147,13 @@ struct jsheap {
 	 */
 	JSValue tmpl[HEAP_TEMPLATES];
 	bool has_tmpl[HEAP_TEMPLATES];
+	/* the large scripts its realms have compiled, as templates for
+	 * the next realm to run the same one (VitaSurf): see
+	 * heap_script_take */
+	struct heap_script scripts[HEAP_SCRIPTS];
+	unsigned n_scripts;
+	size_t script_bytes;	/* their source */
+	uint32_t script_stamp;
 };
 
 struct js_listener;
@@ -434,6 +457,9 @@ struct jsthread {
 	unsigned js_run_ms;       /**< time spent running them */
 	unsigned js_modules;      /**< of those, compiled as ES modules */
 	unsigned js_imports_missed; /**< imports that resolved to nothing */
+	/** scripts taken from a compile another realm of the runtime made
+	 * (heap_script_take), and their size (VitaSurf) */
+	unsigned js_shared, js_shared_bytes;
 	/** the runtime's functions compiled on their first call, and the
 	 * ms that took, when this page began (QJS_LAZY) */
 	uint32_t lazy_count0, lazy_ms0;
@@ -19991,11 +20017,14 @@ static bool heap_has_function(JSContext *ctx, int slot)
 		thread->heap->has_tmpl[slot];
 }
 
+static void heap_drop_scripts(jsheap *heap);
+
 /* let go of a runtime's templates, before it is freed */
 static void heap_drop_functions(jsheap *heap)
 {
 	int i;
 
+	heap_drop_scripts(heap);
 	for (i = 0; i < HEAP_TEMPLATES; i++) {
 		if (heap->has_tmpl[i]) {
 			JS_FreeValueRT(heap->rt, heap->tmpl[i]);
@@ -21316,6 +21345,8 @@ static void heap_collect_now(jsheap *heap, const char *why)
 	unsigned int before = runtime_kb(heap->rt), ms;
 
 	guit->misc->schedule(-1, heap_collect_cb, heap);
+	/* what the scripts kept for later realms hold goes first */
+	heap_drop_scripts(heap);
 	JS_RunGC(heap->rt);
 	ms = (unsigned int)(now_ms() - t0);
 	vitasurf_ms_teardown += ms;
@@ -24252,6 +24283,131 @@ static void module_retry_callback(void *p)
 	}
 }
 
+/*
+ * Large scripts compiled once for every realm of a runtime (VitaSurf).
+ * A page and its frames, and the pages the window goes to next, share
+ * a runtime, and the same script in two of them was compiled twice:
+ * reCAPTCHA's 826 KB, which each of its two frames runs, ten times
+ * over build 800's site test at a second each, Google's ad scripts and
+ * OneTrust's on each site that had them. The first compile is made a
+ * template (JS_MakeFunctionTemplate, which takes the realm out of it)
+ * and run as a clone; a realm that runs the same text from the same
+ * address runs another clone, its functions compiled in that realm
+ * when first called, as the first realm's were. Only classic scripts;
+ * a module's record is of its realm.
+ */
+static struct heap_script *heap_script_find(jsheap *heap, const char *url,
+					    uint64_t hash, size_t len)
+{
+	unsigned i;
+
+	for (i = 0; i < heap->n_scripts; i++) {
+		struct heap_script *h = &heap->scripts[i];
+
+		if (h->hash == hash && h->len == len &&
+		    strcmp(h->url, url) == 0) {
+			return h;
+		}
+	}
+	return NULL;
+}
+
+static void heap_script_drop(jsheap *heap, unsigned i)
+{
+	struct heap_script *h = &heap->scripts[i];
+
+	JS_FreeValueRT(heap->rt, h->tmpl);
+	free(h->url);
+	heap->script_bytes -= h->len;
+	heap->scripts[i] = heap->scripts[--heap->n_scripts];
+}
+
+static void heap_drop_scripts(jsheap *heap)
+{
+	while (heap->n_scripts > 0) {
+		heap_script_drop(heap, heap->n_scripts - 1);
+	}
+}
+
+/* this script as another realm compiled it, or JS_UNDEFINED */
+static JSValue heap_script_take(jsthread *thread, const char *url,
+				uint64_t hash, size_t len)
+{
+	jsheap *heap = thread->heap;
+	struct heap_script *h;
+	JSValue fn;
+
+	if (len < HEAP_SCRIPT_MIN || heap == NULL ||
+	    (h = heap_script_find(heap, url, hash, len)) == NULL) {
+		return JS_UNDEFINED;
+	}
+	fn = JS_CloneFunctionTemplate(thread->ctx, h->tmpl);
+	if (JS_IsException(fn)) {
+		JS_FreeValue(thread->ctx, JS_GetException(thread->ctx));
+		return JS_UNDEFINED;
+	}
+	h->stamp = ++heap->script_stamp;
+	thread->js_shared++;
+	thread->js_shared_bytes += (unsigned)len;
+	return fn;
+}
+
+/*
+ * Keep fn, just compiled or read, for the runtime's other realms when
+ * it can be a template: what this realm runs is then a clone of it.
+ */
+static JSValue heap_script_keep(jsthread *thread, const char *url,
+				uint64_t hash, size_t len, JSValue fn)
+{
+	jsheap *heap = thread->heap;
+	struct heap_script *h;
+	JSValue run;
+	char *u;
+
+	if (len < HEAP_SCRIPT_MIN || len > HEAP_SCRIPT_BUDGET ||
+	    heap == NULL || url[0] == '<' ||
+	    heap_script_find(heap, url, hash, len) != NULL) {
+		return fn;
+	}
+	u = strdup(url);
+	if (u == NULL) {
+		return fn;
+	}
+	if (JS_MakeFunctionTemplate(thread->ctx, fn) != 0) {
+		free(u);
+		return fn;
+	}
+	run = JS_CloneFunctionTemplate(thread->ctx, fn);
+	if (JS_IsException(run)) {
+		/* fn has no realm now: it cannot run */
+		free(u);
+		JS_FreeValue(thread->ctx, fn);
+		return run;
+	}
+	/* room, the least lately taken going first */
+	while (heap->n_scripts > 0 &&
+	       (heap->n_scripts == HEAP_SCRIPTS ||
+		heap->script_bytes + len > HEAP_SCRIPT_BUDGET)) {
+		unsigned i, oldest = 0;
+
+		for (i = 1; i < heap->n_scripts; i++) {
+			if (heap->scripts[i].stamp <
+			    heap->scripts[oldest].stamp) {
+				oldest = i;
+			}
+		}
+		heap_script_drop(heap, oldest);
+	}
+	h = &heap->scripts[heap->n_scripts++];
+	h->url = u;
+	h->hash = hash;
+	h->len = (uint32_t)len;
+	h->stamp = ++heap->script_stamp;
+	h->tmpl = fn;
+	heap->script_bytes += len;
+	return run;
+}
+
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name)
 {
 	JSValue ret;
@@ -24345,7 +24501,9 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * the same two steps internally, so this costs nothing.
 		 */
 		uint64_t t_start = now_ms(), t_compiled, t_done;
-		bool module = false, cached = false;
+		bool module = false, cached = false, shared = false;
+		uint64_t src_hash;
+		size_t src_len;
 		/* taken now, so nothing this script runs inherits it */
 		bool hinted = vitasurf_js_module_hint;
 		JSValue fn;
@@ -24374,9 +24532,19 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * semantics, and the retry costs a parse only on source
 		 * that was not going to run at all.
 		 */
+		src_hash = txtlen >= HEAP_SCRIPT_MIN ?
+			bc_hash(src, txtlen) : 0;
+		src_len = txtlen;
+		fn = heap_script_take(thread, name, src_hash, src_len);
+		if (!JS_IsUndefined(fn)) {
+			shared = true;
+			goto compiled;
+		}
 		fn = bc_load(thread->ctx, name, src, txtlen);
 		if (!JS_IsUndefined(fn)) {
 			cached = true;
+			fn = heap_script_keep(thread, name, src_hash, src_len,
+					      fn);
 			goto compiled;
 		}
 		/*
@@ -24410,6 +24578,10 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			fn = JS_Eval(thread->ctx, src, txtlen, name,
 				     JS_EVAL_TYPE_GLOBAL |
 				     JS_EVAL_FLAG_COMPILE_ONLY | QJS_LAZY);
+		}
+		if (!JS_IsException(fn) && txtlen == src_len) {
+			fn = heap_script_keep(thread, name, src_hash, src_len,
+					      fn);
 		}
 		if (!JS_IsException(fn)) {
 			bc_store(thread->ctx, name, src, txtlen, fn);
@@ -24579,10 +24751,11 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * memory, and not otherwise (VitaSurf): a line per script
 		 * was 26 on a YouTube page.
 		 */
-		if (txtlen > SCRIPT_LOG_BYTES) {
+		if (txtlen > SCRIPT_LOG_BYTES || shared) {
 			vita_log("qjs: script %u KB %s in %u ms, "
 				 "ran in %u ms, runtime memory now %u KB: %s",
 				 (unsigned)(txtlen / 1024),
+				 shared ? "taken from an earlier compile" :
 				 cached ? "read from cache" : "compiled",
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
@@ -24592,6 +24765,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			vita_log("qjs: script %u KB %s in %u ms, "
 				 "ran in %u ms: %s",
 				 (unsigned)(txtlen / 1024),
+				 shared ? "taken from an earlier compile" :
 				 cached ? "read from cache" : "compiled",
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
@@ -24892,11 +25066,14 @@ static bool fire_event(jsthread *thread, const char *type,
 		JS_GetLazyCompileStats(thread->heap->rt, &lazy_n, &lazy_ms);
 		vita_log("qjs: load event, runtime memory %u KB; "
 			 "%u scripts of %u KB compiled in %u ms, ran in %u ms"
+			 ", %u of them, %u KB, taken from the runtime's "
+			 "earlier compiles"
 			 "; %u modules, %u import misses; %u functions "
 			 "compiled when first called, in %u ms",
 			 runtime_kb(thread->heap->rt),
 			 thread->js_scripts, thread->js_bytes / 1024,
 			 thread->js_compile_ms, thread->js_run_ms,
+			 thread->js_shared, thread->js_shared_bytes / 1024,
 			 thread->js_modules, thread->js_imports_missed,
 			 (unsigned)(lazy_n - thread->lazy_count0),
 			 (unsigned)(lazy_ms - thread->lazy_ms0));

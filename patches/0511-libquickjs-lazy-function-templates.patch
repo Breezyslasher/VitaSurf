@@ -1,0 +1,63 @@
+diff --git a/quickjs.c b/quickjs.c
+index 48e2781..40ddeae 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -38217,9 +38217,16 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+     int i;
+ 
+     if (b->code_owner) {
+-        /* a clone: its template holds the rest (VitaSurf) */
++        /* a clone: its template holds the rest (VitaSurf), but for
++           what a lazy one compiled in its own realm */
+         for(i = 0; i < b->cpool_count; i++)
+             JS_FreeValueRT(rt, b->cpool[i]);
++        if (b->lazy) {
++            if (b->lazy->real)
++                JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE,
++                                            b->lazy->real));
++            js_free_rt(rt, b->lazy);
++        }
+         if (b->realm)
+             JS_FreeContext(b->realm);
+         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE,
+@@ -38275,15 +38282,18 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+  * and its constant pool: the code, the variable and closure tables, the
+  * names and the positions are the template's, which each clone holds a
+  * reference to. Nothing writes to them once a function is made. A tree
+- * qualifies when no function in it is waiting to be compiled and its
+- * constants are values or functions, not objects (a tagged template's
+- * strings), which belong to a realm.
++ * qualifies when its constants are values or functions, not objects (a
++ * tagged template's strings), which belong to a realm. A function
++ * waiting to be compiled is cloned waiting, with what it needs to be
++ * compiled in its clone's realm when first called there, so a page's
++ * script, compiled lazily, can be a template too; one compiled already
++ * is not, as its compiled form is of a realm.
+  */
+ static int js_function_template_check(JSFunctionBytecode *b, int depth)
+ {
+     int i;
+ 
+-    if (b->lazy || b->code_owner || depth > 1000)
++    if ((b->lazy && b->lazy->real) || b->code_owner || depth > 1000)
+         return -1;
+     for(i = 0; i < b->cpool_count; i++) {
+         JSValueConst v = b->cpool[i];
+@@ -38337,6 +38347,17 @@ static JSValue js_function_clone(JSContext *ctx, JSFunctionBytecode *t)
+         return JS_EXCEPTION;
+     memcpy(b, t, sizeof(*b));
+     b->header.ref_count = 1;
++    b->lazy = NULL;
++    if (t->lazy) {
++        /* its own, as it is compiled in this realm */
++        b->lazy = js_malloc(ctx, sizeof(*b->lazy));
++        if (!b->lazy) {
++            js_free(ctx, b);
++            return JS_EXCEPTION;
++        }
++        *b->lazy = *t->lazy;
++        b->lazy->real = NULL;
++    }
+     b->realm = JS_DupContext(ctx);
+     b->code_owner = t;
+     js_dup(JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, t));
