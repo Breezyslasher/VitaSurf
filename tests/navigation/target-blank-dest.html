@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<!-- where tests/navigation/target-blank.html's links go: says whether it
+     opened in the top window or a frame (VitaSurf) -->
+<html><head><meta charset="utf-8"><title>Target blank destination</title></head>
+<body><script>
+console.log('target-blank: ' + location.search.slice(6) + ' opened in ' +
+  (window.top === window ? 'the top window' : 'a frame'));
+</script></body></html>

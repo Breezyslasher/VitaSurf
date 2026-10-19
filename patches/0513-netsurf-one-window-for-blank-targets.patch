@@ -1,0 +1,35 @@
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index ada4784e9..8c860f57f 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -4953,8 +4953,15 @@ browser_window_find_target(struct browser_window *bw,
+ 		/* not a mouse button 2 click
+ 		 * not a mouse button 1 click with ctrl pressed
+ 		 * configured to ignore target="_blank" */
+-		if (!strcasecmp(target, "_blank"))
++		if (!strcasecmp(target, "_blank")) {
++			/* the page the link names takes the screen, as the
++			 * new tab a browser would open does: from a frame,
++			 * an ad's landing page had opened in its little
++			 * frame (VitaSurf) */
++			while (bw->parent)
++				bw = bw->parent;
+ 			return bw;
++		}
+ 	}
+ 
+ 	/* handle reserved keywords */
+@@ -5026,8 +5033,12 @@ browser_window_find_target(struct browser_window *bw,
+ 		return bw_target;
+ 
+ 	/* we require a new window using the target name */
+-	if (!nsoption_bool(target_blank))
++	if (!nsoption_bool(target_blank)) {
++		/* as for _blank above (VitaSurf) */
++		while (bw->parent)
++			bw = bw->parent;
+ 		return bw;
++	}
+ 
+ 	error = browser_window_create(flags, NULL, NULL, bw, &bw_target);
+ 	if (error != NSERROR_OK) {

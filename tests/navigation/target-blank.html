@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<!--
+  Links the user follows that would open a new window (VitaSurf). The
+  Vita has one window: a link with target="_blank", or naming a window
+  no frame has, opens in the top window, as the new tab a browser would
+  open takes the screen. NetSurf had made a second browser window over
+  the first, and the page left behind went on running unseen, its frames
+  loading and its layout rebuilt, until it crashed the browser being
+  drawn. tests/navigation/target-blank-test.sh taps each link and
+  prints what opened where.
+-->
+<html><head><meta charset="utf-8"><title>Target blank</title>
+<style>
+body { margin: 0; font: 30px/40px sans-serif; }
+a { display: block; height: 40px; }
+iframe { display: block; border: 0; width: 600px; height: 120px; }
+</style></head>
+<body>
+<a id="blank" href="target-blank-dest.html?from=top-blank" target="_blank">top, _blank</a>
+<a id="named" href="target-blank-dest.html?from=top-named" target="no-such-window">top, named</a>
+<iframe id="f" srcdoc="<style>body{margin:0;font:30px/40px sans-serif}a{display:block;height:40px}</style><a href='target-blank-dest.html?from=frame-blank' target='_blank'>frame, _blank</a><a href='target-blank-dest.html?from=frame-self'>frame, itself</a>"></iframe>
+<script>console.log('target-blank: ready');</script>
+</body></html>

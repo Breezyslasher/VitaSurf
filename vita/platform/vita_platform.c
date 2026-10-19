@@ -154,6 +154,18 @@ void vita_options_floor(void)
 	if (nsoption_int(memory_cache_size) < 24 * 1024 * 1024) {
 		nsoption_set_int(memory_cache_size, 24 * 1024 * 1024);
 	}
+	/*
+	 * One window, whatever Choices says: a link with target="_blank",
+	 * or naming a window no frame has, opens in the window it was
+	 * followed in (browser_window_find_target), as a script's click
+	 * does (followLink). NetSurf made a second browser window for it,
+	 * mapped over the first, and the page left in the first went on
+	 * running unseen: W3Schools' tutorial, left for its Tryit editor in
+	 * build 804's log, ran its ad frames and rebuilt its 14,000-node
+	 * layout three times behind it, could not be gone back to, and was
+	 * still being drawn when the browser crashed in its redraw.
+	 */
+	nsoption_set_bool(target_blank, false);
 #ifdef VITASURF_ANIMATIONS
 	/* the animation build runs them, whatever Choices says */
 	nsoption_set_bool(css_animations, true);
