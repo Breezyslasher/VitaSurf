@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<!--
+  Object and array literals parsed before it is known whether they are
+  destructuring patterns (VitaSurf, patch 0508).
+
+  The compiler parses a '{' or '[' in an expression as a literal at once
+  and, when '=' follows, or the literal holds what only a pattern may
+  ('{a = 1}', a second __proto__), takes out what it made and parses it
+  again as a pattern. Each case is compiled both as the page's script
+  and inside a function compiled when first called; each line must say
+  PASS, as under Node. The last case checks that a deeply nested literal
+  with an error in it is not parsed again at every level.
+-->
+<html><head><meta charset="utf-8"><title>Literals and patterns</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, good, got) {
+  out.push((good ? 'PASS ' : 'FAIL ') + name + (good ? '' : ': ' + got));
+}
+/* source -> what it gives, or 'SyntaxError' */
+var CASES = [
+  ['var a=1,b=2;[a,b]=[b,a];a+","+b', '2,1'],
+  ['var a,b;({a,b}={a:3,b:4});a+b', 7],
+  ['var a;({a=5}={});a', 5],
+  ['var a,b;({a=5,b:{c:b=6}={}}={});a+b', 11],
+  ['var a;[{a=7}]=[{}];a', 7],
+  ['var a;[[{a=8}]]=[[{}]];a', 8],
+  ['var x={};[x.p,x["q"]]=[1,2];x.p+x.q', 3],
+  ['var a,b;a=[b]=[9];a.length+b', 10],
+  ['var a,b;[a,b=3]=[1];a+b', 4],
+  ['var r;[...r]=[1,2];r.length', 2],
+  ['var r;({...r}={a:1,b:2});Object.keys(r).join()', 'a,b'],
+  ['var a;({__proto__:a,__proto__:a}={});typeof a', 'object'],
+  ['var C;[C=class{static k=4;}]=[];C.k', 4],
+  ['var f;[f=function(){return 5}]=[];f()', 5],
+  ['var g;({g=()=>({a:1}).a}={});g()', 1],
+  ['var a;[a]=[{b:[1,{c:2}]}];a.b[1].c', 2],
+  ['var o={x:[1,2,{y:3}]};o.x[2].y', 3],
+  ['var a,b;for([a,b] of [[1,2]]);a+b', 3],
+  ['var a;[a]=[1],[a]=[a+1];a', 2],
+  ['var k="z",v;({[k]:v}={z:6});v', 6],
+  ['var n=0,o={a:1,get b(){return n++}};o.b+o.b', 1],
+  ['({a=1})', 'SyntaxError'],
+  ['[{a=1}]', 'SyntaxError'],
+  ['({a:{b=1}})', 'SyntaxError'],
+  ['({__proto__:1,__proto__:2})', 'SyntaxError'],
+  ['({get a(){}}={})', 'SyntaxError'],
+  ['[a+1]=[1]', 'SyntaxError'],
+  ['({a:1}.b=2)', 2],
+  ['[1,2].length', 2]
+];
+function run(src, lazy) {
+  try {
+    if (lazy) {
+      /* the body is compiled when the function is first called */
+      return (0, eval)('(function(){return eval(' + JSON.stringify(src) + ')})')();
+    }
+    return (0, eval)(src);
+  } catch (e) {
+    return e && e.name === 'SyntaxError' ? 'SyntaxError' : 'threw ' + e;
+  }
+}
+CASES.forEach(function (c) {
+  var got = run(c[0], false);
+  ok(c[0], got === c[1], got);
+});
+/* the same, inside functions of a script compiled lazily: a script
+   element's functions are compiled when first called */
+var s = document.createElement('script');
+s.textContent = 'window.__lazy = [' + CASES.filter(function (c) {
+  return c[1] !== 'SyntaxError';
+}).map(function (c) {
+  return 'function(){' + (c[0].indexOf(';') < 0 ? 'return ' + c[0] :
+    c[0].replace(/;([^;]*)$/, ';return $1')) + '}';
+}).join(',') + '];';
+document.head.appendChild(s);
+var i = 0;
+CASES.forEach(function (c) {
+  if (c[1] === 'SyntaxError') return;
+  var got;
+  try { got = window.__lazy[i++](); } catch (e) { got = 'threw ' + e; }
+  ok('lazily compiled: ' + c[0], got === c[1], got);
+});
+/* 400 brackets deep with an error in the middle: each level parsed at
+   most twice, not twice for each level around it */
+var deep = '', t0, d;
+for (var k = 0; k < 400; k++) deep += '[';
+deep += '{a=1}';
+for (k = 0; k < 400; k++) deep += ']';
+t0 = Date.now();
+d = run(deep, false);
+ok('a deep literal with an error is a SyntaxError, quickly',
+   d === 'SyntaxError' && Date.now() - t0 < 2000,
+   d + ' in ' + (Date.now() - t0) + ' ms');
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('literal-patterns: ' + l); });
+console.log('literal-patterns: done');
+</script>
+</body></html>

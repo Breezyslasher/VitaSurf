@@ -1,0 +1,201 @@
+diff --git a/quickjs.c b/quickjs.c
+index c9199fb..48e2781 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22583,6 +22583,11 @@ typedef struct JSParseState {
+        already scanned, by the bracket's place in the source (VitaSurf) */
+     struct JSSkipMemo *skip_memo;
+     uint32_t skip_memo_size, skip_memo_count;
++    /* object and array literals being parsed before it is known that
++       they are not patterns, and whether one failed on what only a
++       pattern may hold (VitaSurf): see JSLiteralMark */
++    int literal_depth;
++    bool literal_cover;
+ } JSParseState;
+ 
+ typedef struct JSSkipMemo {
+@@ -26461,6 +26466,9 @@ static __exception int js_parse_object_literal(JSParseState *s)
+             goto fail;
+ 
+         if (prop_type == PROP_TYPE_VAR) {
++            /* 'a = 1' is for a pattern (VitaSurf): see JSLiteralMark */
++            if (s->token.val == '=')
++                s->literal_cover = true;
+             /* shortcut for x: x */
+             emit_op(s, OP_scope_get_var);
+             emit_atom(s, name);
+@@ -26503,6 +26511,9 @@ static __exception int js_parse_object_literal(JSParseState *s)
+             }
+             emit_u8(s, op_flags | OP_DEFINE_METHOD_ENUMERABLE);
+         } else {
++            /* 'a = 1' is for a pattern (VitaSurf): see JSLiteralMark */
++            if (s->token.val == '=')
++                s->literal_cover = true;
+             if (js_parse_expect(s, ':'))
+                 goto fail;
+             if (js_parse_assign_expr(s))
+@@ -26513,6 +26524,8 @@ static __exception int js_parse_object_literal(JSParseState *s)
+                 emit_op(s, OP_drop);
+             } else if (name == JS_ATOM___proto__) {
+                 if (has_proto) {
++                    /* as a pattern's names they may (VitaSurf) */
++                    s->literal_cover = true;
+                     js_parse_error(s, "duplicate __proto__ property name");
+                     goto fail;
+                 }
+@@ -28238,6 +28251,121 @@ static void optional_chain_test(JSParseState *s, int *poptional_chaining_label,
+ }
+ 
+ /* allowed parse_flags: PF_POSTFIX_CALL */
++static void free_bytecode_atoms(JSRuntime *rt,
++                                const uint8_t *bc_buf, int bc_len,
++                                bool use_short_opcodes);
++static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd);
++
++/*
++ * An object or array literal parsed before it is known not to be a
++ * destructuring pattern (VitaSurf). Which of the two a '{' or '[' in an
++ * expression begins depends on whether '=' follows its closing bracket,
++ * and js_parse_skip_parens_token read every literal to its end to find
++ * out, the functions inside it included, before the literal was parsed:
++ * a sixth of compiling a bundle, and an eighth of compiling a function
++ * when it is first called. A literal that is a pattern is rare, so the
++ * literal is parsed at once and, when '=' follows or it is not a
++ * literal at all ('{a = 1}', which only a pattern may hold), what it
++ * added to the function is taken out again and the old way taken: the
++ * code, constants, labels and functions it made, and the scopes and
++ * variables of a class inside it.
++ */
++typedef struct JSLiteralMark {
++    JSParsePos pos;
++    JSFunctionDef *fd;
++    struct list_head *last_child;
++    int bc_size, last_opcode_pos, label_count, cpool_count;
++    int var_count, scope_count, scope_level, scope_first, scope_first_at;
++    int closure_var_count, global_var_count, with_depth;
++    bool skip_values;
++} JSLiteralMark;
++
++static void js_literal_mark(JSParseState *s, JSLiteralMark *m)
++{
++    JSFunctionDef *fd = s->cur_func;
++
++    js_parse_get_pos(s, &m->pos);
++    m->fd = fd;
++    m->last_child = fd->child_list.prev;
++    m->bc_size = fd->byte_code.size;
++    m->last_opcode_pos = fd->last_opcode_pos;
++    m->label_count = fd->label_count;
++    m->cpool_count = fd->cpool_count;
++    m->var_count = fd->var_count;
++    m->scope_count = fd->scope_count;
++    m->scope_level = fd->scope_level;
++    m->scope_first = fd->scope_first;
++    m->scope_first_at = fd->scopes[fd->scope_level].first;
++    m->closure_var_count = fd->closure_var_count;
++    m->global_var_count = fd->global_var_count;
++    m->with_depth = s->with_depth;
++    m->skip_values = s->skip_values;
++}
++
++/* the variable table's index again, for fd->var_count variables */
++static int js_literal_rehash_vars(JSContext *ctx, JSFunctionDef *fd)
++{
++    int n = fd->var_count;
++
++    js_free(ctx, fd->vars_htab);
++    fd->vars_htab = NULL;
++    for (fd->var_count = 0; fd->var_count < n;) {
++        fd->var_count++;
++        if (update_var_htab(ctx, fd)) {
++            fd->var_count = n;
++            return -1;
++        }
++    }
++    return 0;
++}
++
++/* take out what the literal added, and go back to its '{' or '['; false
++   when that cannot be done, with any error the parse raised left */
++static bool js_literal_undo(JSParseState *s, JSLiteralMark *m, bool failed)
++{
++    JSContext *ctx = s->ctx;
++    JSFunctionDef *fd = m->fd;
++    int i;
++
++    if (fd->byte_code.error || fd->closure_var_count != m->closure_var_count ||
++        fd->global_var_count != m->global_var_count ||
++        fd->var_count < m->var_count || fd->scope_count < m->scope_count ||
++        fd->label_count < m->label_count || fd->cpool_count < m->cpool_count ||
++        fd->byte_code.size < m->bc_size)
++        return false;
++    if (failed)
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    s->cur_func = fd;
++    while (fd->child_list.prev != m->last_child) {
++        JSFunctionDef *c = list_entry(fd->child_list.prev, JSFunctionDef, link);
++        js_free_function_def(ctx, c);
++    }
++    free_bytecode_atoms(ctx->rt, fd->byte_code.buf + m->bc_size,
++                        fd->byte_code.size - m->bc_size, false);
++    fd->byte_code.size = m->bc_size;
++    fd->last_opcode_pos = m->last_opcode_pos;
++    for (i = m->cpool_count; i < fd->cpool_count; i++)
++        JS_FreeValue(ctx, fd->cpool[i]);
++    fd->cpool_count = m->cpool_count;
++    fd->label_count = m->label_count;
++    if (fd->var_count != m->var_count) {
++        for (i = m->var_count; i < fd->var_count; i++)
++            JS_FreeAtom(ctx, fd->vars[i].var_name);
++        fd->var_count = m->var_count;
++        if (js_literal_rehash_vars(ctx, fd))
++            return false;
++    }
++    fd->scope_count = m->scope_count;
++    fd->scope_level = m->scope_level;
++    fd->scope_first = m->scope_first;
++    fd->scopes[fd->scope_level].first = m->scope_first_at;
++    s->with_depth = m->with_depth;
++    s->skip_values = m->skip_values;
++    if (js_parse_seek_token(s, &m->pos))
++        return false;
++    return true;
++}
++
+ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+ {
+     FuncCallType call_type;
+@@ -28412,6 +28540,33 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+     case '[':
+         {
+             int skip_bits;
++            JSLiteralMark mark;
++            int r;
++
++            /* a literal, unless '=' follows (VitaSurf): see
++               JSLiteralMark */
++            js_literal_mark(s, &mark);
++            s->literal_cover = false;
++            s->literal_depth++;
++            if (s->token.val == '{')
++                r = js_parse_object_literal(s);
++            else
++                r = js_parse_array_literal(s);
++            s->literal_depth--;
++            if (r == 0 && s->token.val != '=')
++                break;
++            /* an error is the literal's, unless it is one only a pattern
++               may hold; inside another literal being tried, that one
++               tries again, so nothing is parsed more than twice at a
++               level */
++            if (r != 0 && (!s->literal_cover || s->literal_depth > 0))
++                return -1;
++            if (!js_literal_undo(s, &mark, r != 0)) {
++                if (r == 0)
++                    JS_ThrowOutOfMemory(s->ctx);
++                return -1;
++            }
++            s->literal_cover = false;
+             if (js_parse_skip_parens_token(s, &skip_bits, false) == '=') {
+                 if (js_parse_destructuring_element(s, 0, false, false, skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
+                     return -1;
